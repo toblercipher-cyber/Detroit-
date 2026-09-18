@@ -1,0 +1,81 @@
+@import url("https://fonts.googleapis.com/css2?family=Syne:wght@600;700;800&family=IBM+Plex+Sans:ital,wght@0,400;0,500;0,600;1,400&family=Space+Mono:wght@400;700&display=swap");
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 20 9% 6%;
+    --foreground: 32 24% 95%;
+
+    --card: 20 10% 9%;
+    --card-foreground: 32 24% 95%;
+
+    --primary: 14 88% 55%;
+    --primary-foreground: 20 20% 8%;
+
+    --secondary: 20 10% 14%;
+    --secondary-foreground: 32 24% 95%;
+
+    --muted: 20 9% 13%;
+    --muted-foreground: 30 9% 62%;
+
+    --accent: 14 88% 55%;
+    --accent-foreground: 20 20% 8%;
+
+    --ember: 14 88% 55%;
+    --ember-dim: 12 65% 32%;
+
+    --border: 25 10% 20%;
+    --input: 25 10% 20%;
+    --ring: 14 88% 55%;
+
+    --radius: 0.375rem;
+  }
+
+  * {
+    @apply border-border;
+  }
+
+  html {
+    color-scheme: dark;
+    scroll-behavior: smooth;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    html {
+      scroll-behavior: auto;
+    }
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-feature-settings: "ss01" 1, "tnum" 1;
+  }
+
+  ::selection {
+    background-color: hsl(var(--ember) / 0.35);
+    color: hsl(var(--foreground));
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--border));
+    border-radius: 999px;
+    border: 2px solid hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--ember-dim));
+  }
+
+  :focus-visible {
+    outline: 2px solid hsl(var(--ember));
+    outline-offset: 3px;
+  }
+}
