@@ -1,6 +1,28 @@
 # Product
 
+> ## ⚠️ LEGACY DOCUMENT — NOT AUTHORITATIVE
+>
+> This file was created for the **original Landing Page build only**. Its scope
+> statements (for example "scoped to the marketing landing page only, specifically
+> its first section" and "the rest of the pipeline is explicitly out of scope — do
+> not build toward it") describe that earlier, narrower task.
+>
+> - It is retained for **historical and design context** only.
+> - It is **NOT authoritative** for backend scope, full-product scope, current
+>   frontend scope, or architecture decisions.
+> - Do **not** derive a product specification from it, and do not treat its
+>   out-of-scope statements as current constraints.
+> - Its record of the approved Landing Page's visual direction and content
+>   constraints (no fabricated testimonials, logos, pricing or benchmarks)
+>   remains useful background.
+>
+> **Current authority order:** `CLAUDE.md` → `skills.md` → `docs/` → this file.
+>
+> The rest of this file is intentionally left unrewritten so the original build
+> context stays intact.
+
 <!-- impeccable:product-schema 1 -->
+
 
 ## Platform
 

@@ -6,4 +6,27 @@ dist-ssr
 .impeccable/config.local.json
 *.tsbuildinfo
 .venv
-Refrence_images
+
+# Refrence_images/ is a scratch folder of unrelated image experiments, with one
+# exception: chatbot_refrence.png is the ONLY reference asset the project depends on
+# (CLAUDE.md 28), and the Reference Analysis stage cannot run without it. It must
+# survive a fresh clone. The folder is excluded by CONTENTS rather than by name,
+# because git does not descend into an excluded directory and a negation inside one
+# never matches.
+Refrence_images/*
+!Refrence_images/chatbot_refrence.png
+
+# Python bytecode. Machine-local build output, never source.
+__pycache__/
+*.py[cod]
+
+# Backend runtime (docs/runtime.md 3.1, docs/security.md 2)
+# .env holds real secrets (ANTHROPIC_API_KEY, future Supabase credentials) and must
+# never reach git history. .env.example is deliberately NOT matched by this pattern
+# and stays tracked as the documented placeholder contract.
+.env
+
+# var/ is builder runtime data (BUILDER_DATA_DIR): checkpoints, project state
+# artifacts, uploaded reference images, and generated website workspaces. It is
+# machine-local output, never source.
+var/
