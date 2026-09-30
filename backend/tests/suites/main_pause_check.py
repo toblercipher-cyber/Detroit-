@@ -14,6 +14,7 @@ import tempfile as _tf
 from pathlib import Path as _P
 from langchain_core.runnables import Runnable as _R
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
+from backend.agents.frontend_architect import FrontendArchitectAgent as _FAA
 from backend.memory.artifacts import JsonArtifactRepository as _JAR
 from backend.schemas.state import ReferenceAnalysis as _RA
 
@@ -21,16 +22,20 @@ from backend.schemas.state import ReferenceAnalysis as _RA
 class _RefStub(_R):
     def invoke(self, i, config=None, **k): raise NotImplementedError
     def with_structured_output(self, model):
+        # Return the model that was ASKED for. Every field on these outputs is
+        # optional, so an empty instance is valid -- and returning a fixed type
+        # would hand one node another node's output.
         class _S(_R):
             def invoke(s, i, config=None, **k): raise NotImplementedError
             async def ainvoke(s, i, config=None, **k):
-                return _RA(composition="a reference reading")
+                return model()
         return _S()
 
 
 def _ref_deps():
     """The two fields every WorkflowDependencies now requires."""
     return dict(reference_analyzer=_RAA(_RefStub()),
+                frontend_architect=_FAA(_RefStub()),
                 repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
 
 
@@ -55,12 +60,12 @@ import backend.main as m
 from backend.config.settings import get_settings
 svc = m.build_project_service(get_settings())
 
-print("=== 1. Composition root built four clients, one per role ===")
-print("   clients built:", len(CALLS), ok(len(CALLS) == 4))
+print("=== 1. Composition root built five clients, one per role ===")
+print("   clients built:", len(CALLS), ok(len(CALLS) == 5))
 temps = [c["temperature"] for c in CALLS]
 toks = [c["max_tokens"] for c in CALLS]
-print("   temperatures :", temps, ok(temps == [0.0, 0.4, 0.6, 0.2]))
-print("   max_tokens   :", toks, ok(toks == [4000, 8000, 8000, 8000]))
+print("   temperatures :", temps, ok(temps == [0.0, 0.4, 0.6, 0.2, 0.2]))
+print("   max_tokens   :", toks, ok(toks == [4000, 8000, 8000, 8000, 8000]))
 print("   key not echoed in kwargs repr:",
       ok("test-only-not-a-real-key" not in str({k: v for k, v in CALLS[0].items() if k != "api_key"})))
 

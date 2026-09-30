@@ -51,6 +51,7 @@ from langgraph.types import interrupt
 
 from backend.agents.base import AgentFailure, AgentFailureKind
 from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
@@ -84,6 +85,7 @@ NODE_DESIGN = WorkflowStage.DESIGN.value
 NODE_DESIGN_GATE = "design_gate"
 NODE_REFERENCE_ANALYSIS = WorkflowStage.REFERENCE_ANALYSIS.value
 NODE_REFERENCE_GATE = "reference_gate"
+NODE_FRONTEND_ARCHITECTURE = WorkflowStage.FRONTEND_ARCHITECTURE.value
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
@@ -119,6 +121,7 @@ class WorkflowDependencies:
     planner: PlannerAgent
     design_director: DesignDirectorAgent
     reference_analyzer: ReferenceAnalyzerAgent
+    frontend_architect: FrontendArchitectAgent
     # Reference Analysis needs the image BYTES, which state does not carry;
     # this is the only reason the graph touches persistence at all.
     repository: StateRepository
@@ -385,6 +388,75 @@ async def reference_analysis_node(
     }
 
 
+async def frontend_architecture_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """Decide what components exist and how they nest, before anything is written.
+
+    Owns: ``frontend_architecture`` and ``component_tree``.
+
+    NO GATE AFTER THIS STAGE
+        ``docs/workflow.md`` 1 marks it "no". The user has already approved the
+        plan, the design system and — when there was one — the reference reading.
+        Architecture follows from those three; asking for a fourth approval of a
+        component list would be a checkpoint without a decision in it
+        (CLAUDE.md 11).
+
+    WHY TWO FIELDS ARE WRITTEN
+        The agent returns one ``FrontendArchitecture``, which nests the tree.
+        ``ProjectState`` keeps ``component_tree`` at the top level as well,
+        because the Builder's context grant names that field directly. Lifting it
+        here is what makes the Builder's slice resolvable; leaving it nested would
+        hand the Builder an empty tree while the data sat one level down.
+
+    COMPONENT INVENTORY
+        Supplied only when the project has files. On a first pass there are none,
+        and the agent is told so explicitly rather than left to infer it. On a
+        later pass the inventory is what makes "reuse before new" enforceable.
+    """
+    stage = WorkflowStage.FRONTEND_ARCHITECTURE
+
+    # Paths only. The architect decides structure, not implementation, so it needs
+    # to know what exists — not what is in it (docs/agents.md 4.5).
+    inventory = [ref.path for ref in state.generated_files] or None
+
+    try:
+        context = deps.context_builder.build(
+            state,
+            AgentRole.FRONTEND_ARCHITECT,
+            task=(
+                "Define the component architecture for the approved plan and "
+                "design system."
+            ),
+            component_inventory=inventory,
+        )
+    except ContextPermissionError as exc:
+        return _failure_update(
+            stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, str(exc))
+        )
+
+    result = await deps.frontend_architect.run(context)
+    if not result.ok:
+        return _failure_update(stage, result.failure)
+
+    architecture = result.output
+    logger.info(
+        "frontend architecture complete project_id=%s pages=%d reused=%d new=%d",
+        state.project_id,
+        len(architecture.pages),
+        len(architecture.reused_components),
+        len(architecture.new_components),
+    )
+    return {
+        "frontend_architecture": architecture,
+        "component_tree": architecture.component_tree,
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
 def _gate_node(
     state: ProjectState,
     *,
@@ -636,6 +708,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     def _reference_gate(state: ProjectState) -> dict[str, Any]:
         return reference_gate_node(state, deps)
 
+    async def _frontend_architecture(state: ProjectState) -> dict[str, Any]:
+        return await frontend_architecture_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
@@ -643,6 +718,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_DESIGN_GATE, _design_gate)
     graph.add_node(NODE_REFERENCE_ANALYSIS, _reference_analysis)
     graph.add_node(NODE_REFERENCE_GATE, _reference_gate)
+    graph.add_node(NODE_FRONTEND_ARCHITECTURE, _frontend_architecture)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
@@ -668,19 +744,26 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
         route_after_design_gate,
         {
             "approved": NODE_REFERENCE_ANALYSIS,
-            "skip_reference": END,
+            "skip_reference": NODE_FRONTEND_ARCHITECTURE,
             "revise": NODE_DESIGN,
             "stop": END,
         },
     )
 
-    # The approved reference branch terminates for now. `frontend_architecture` is
-    # next; it is not stubbed, so the graph never claims a stage it cannot run.
     graph.add_conditional_edges(
         NODE_REFERENCE_GATE,
         route_after_gate,
-        {"approved": END, "revise": NODE_REFERENCE_ANALYSIS, "stop": END},
+        {
+            "approved": NODE_FRONTEND_ARCHITECTURE,
+            "revise": NODE_REFERENCE_ANALYSIS,
+            "stop": END,
+        },
     )
+
+    # Architecture has no gate (docs/workflow.md 1), so it runs straight through.
+    # It terminates for now: `build` is next and is not stubbed, so the graph
+    # never claims a stage it cannot run.
+    graph.add_edge(NODE_FRONTEND_ARCHITECTURE, END)
 
     if checkpointer is None:
         logger.warning(

@@ -25,11 +25,13 @@ from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
+from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.services.projects import ProjectService
 from backend.schemas.enums import HitlAction, RunStatus, WorkflowStage
 from backend.schemas.api import HitlDecisionRequest
 from backend.schemas.state import (ProjectState, NormalizedRequirements, Plan,
-                                   DesignSpec, ReferenceAnalysis)
+                                   DesignSpec, ReferenceAnalysis,
+                                   FrontendArchitecture)
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"PIXELDATA" * 12
 JPEG = b"\xff\xd8\xff\xe0" + b"jpegbytes" * 12
@@ -49,6 +51,8 @@ class FakeChat(Runnable):
                 return Plan(objective="a coffee shop landing page")
             if model is DesignSpec:
                 return DesignSpec(font_families=["Inter"], visual_tone="warm")
+            if model is FrontendArchitecture:
+                return FrontendArchitecture(pages=["/"])
             N["ref"] += 1
             # Real fields only: ReferenceAnalysis is extra="forbid" and has no
             # headline field, so a made-up one fails schema validation.
@@ -73,6 +77,7 @@ def build(tmp=None):
         planner=PlannerAgent(FakeChat()),
         design_director=DesignDirectorAgent(FakeChat()),
         reference_analyzer=ReferenceAnalyzerAgent(FakeChat()),
+        frontend_architect=FrontendArchitectAgent(FakeChat()),
         repository=repo), checkpointer=InMemorySaver())
     svc = ProjectService(repository=repo, workflow=g, settings=get_settings())
     return svc
@@ -91,7 +96,7 @@ print("=== 1. Topology includes the reference stage and its gate ===")
 svc = build()
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   7 nodes        :", ok(len(nodes) == 7))
+print("   8 nodes        :", ok(len(nodes) == 8))  # + frontend_architecture
 print("   reference node :", ok(NODE_REFERENCE_ANALYSIS in nodes))
 print("   reference gate :", ok(NODE_REFERENCE_GATE in nodes))
 
@@ -249,3 +254,101 @@ g = client.get("%s/%s/hitl" % (P, pid2))
 print("   gate served    :", g.status_code, ok(g.status_code == 200))
 print("   it is the reference gate:", g.json()["stage"],
       ok(g.json()["stage"] == "reference_analysis"))
+
+print()
+print("=== 11. Frontend Architecture: reached BOTH ways, no gate after ===")
+from backend.schemas.state import ComponentTree, ComponentNode
+
+ARCH = FrontendArchitecture(
+    pages=["/"],
+    component_tree=ComponentTree(root=[ComponentNode(name="Hero")]),
+    reused_components=["Button"],
+    new_components=["MenuGrid"],
+)
+
+
+class ArchChat(FakeChat):
+    def with_structured_output(self, model):
+        base = FakeChat.with_structured_output(self, model)
+        if model is not FrontendArchitecture:
+            return base
+        class _S(Runnable):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                SEEN["arch_prompt"] = i.to_messages() if hasattr(i, "to_messages") else i
+                return ARCH
+        return _S()
+
+
+def build_arch():
+    repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="arch_")))
+    g = build_workflow(WorkflowDependencies(
+        context_builder=ContextBuilder(),
+        requirement_analyzer=RequirementAnalyzerAgent(ArchChat()),
+        planner=PlannerAgent(ArchChat()),
+        design_director=DesignDirectorAgent(ArchChat()),
+        reference_analyzer=ReferenceAnalyzerAgent(ArchChat()),
+        frontend_architect=FrontendArchitectAgent(ArchChat()),
+        repository=repo), checkpointer=InMemorySaver())
+    return ProjectService(repository=repo, workflow=g, settings=get_settings())
+
+
+# Path A: no reference image -> skip_reference must now land on architecture.
+svcA = build_arch()
+pidA = svcA.create(prompt="no reference here").project_id
+stA = approve_to_design(svcA, pidA)
+asyncio.run(svcA.submit_hitl_decision(pidA, HitlDecisionRequest(
+    checkpoint_id=stA.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
+a = svcA.get(pidA)
+print("   [skip path] architecture ran :", ok(a.frontend_architecture is not None))
+print("   [skip path] reference skipped:", ok(a.reference_analysis is None))
+print("   [skip path] stage reached    :", a.current_stage.value,
+      ok(a.current_stage is WorkflowStage.FRONTEND_ARCHITECTURE))
+
+# Path B: with a reference image -> approval of the reference gate reaches it.
+svcB = build_arch()
+pidB = svcB.create(prompt="with a reference").project_id
+svcB.attach_reference_image(pidB, PNG, "image/png")
+stB = approve_to_design(svcB, pidB)
+asyncio.run(svcB.submit_hitl_decision(pidB, HitlDecisionRequest(
+    checkpoint_id=stB.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
+b = svcB.get(pidB)
+print("   [ref path] paused at reference gate:",
+      ok(b.pending_checkpoint.stage is WorkflowStage.REFERENCE_ANALYSIS))
+asyncio.run(svcB.submit_hitl_decision(pidB, HitlDecisionRequest(
+    checkpoint_id=b.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
+b2 = svcB.get(pidB)
+print("   [ref path] architecture ran  :", ok(b2.frontend_architecture is not None))
+print("   [ref path] stage reached     :", b2.current_stage.value,
+      ok(b2.current_stage is WorkflowStage.FRONTEND_ARCHITECTURE))
+
+print()
+print("=== 12. NO gate after architecture (workflow.md 1 says 'no') ===")
+print("   run ended, no pending gate:", ok(b2.pending_checkpoint is None))
+print("   status not awaiting_hitl  :", b2.run_status.value,
+      ok(b2.run_status is not RunStatus.AWAITING_HITL))
+print("   no architecture approval recorded:",
+      ok(all(d.stage is not WorkflowStage.FRONTEND_ARCHITECTURE
+             for d in b2.approved_decisions)))
+print("   approvals stop at reference:", [d.stage.value for d in b2.approved_decisions],
+      ok([d.stage.value for d in b2.approved_decisions]
+         == ["planning", "design", "reference_analysis"]))
+
+print()
+print("=== 13. BOTH state fields written (component_tree lifted, not left nested) ===")
+print("   frontend_architecture set:", ok(b2.frontend_architecture is not None))
+print("   component_tree lifted    :", ok(b2.component_tree is not None))
+print("   lifted tree is the SAME one:",
+      ok(b2.component_tree == b2.frontend_architecture.component_tree))
+print("   tree content survived    :",
+      ok(b2.component_tree.root[0].name == "Hero"))
+print("   reused/new preserved     :",
+      ok(b2.frontend_architecture.reused_components == ["Button"]
+         and b2.frontend_architecture.new_components == ["MenuGrid"]))
+
+print()
+print("=== 14. Empty inventory on a first pass is stated, not implied ===")
+txt = str(SEEN.get("arch_prompt"))
+print("   architect was prompted   :", ok(SEEN.get("arch_prompt") is not None))
+print("   told nothing is built yet:", ok("nothing built yet" in txt))
+print("   warned not to assume     :", ok("Do not assume a component exists" in txt))

@@ -48,6 +48,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.agents.base import model_kwargs_for
 from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
@@ -189,6 +190,9 @@ def build_project_service(settings: Settings) -> ProjectService:
             ),
             reference_analyzer=ReferenceAnalyzerAgent(
                 model_for(AgentRole.REFERENCE_ANALYZER)
+            ),
+            frontend_architect=FrontendArchitectAgent(
+                model_for(AgentRole.FRONTEND_ARCHITECT)
             ),
             # The same repository the service uses. Reference Analysis needs the
             # image bytes, which state does not carry; sharing one instance keeps
