@@ -8,6 +8,32 @@ import langchain_anthropic
 from langchain_core.runnables import Runnable
 from backend.schemas.state import ProjectState, NormalizedRequirements, Plan, DesignSpec
 
+# --- WorkflowDependencies gained reference_analysis collaborators ---
+# Self-contained: it must not depend on whatever stub shape this suite uses.
+import tempfile as _tf
+from pathlib import Path as _P
+from langchain_core.runnables import Runnable as _R
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
+from backend.memory.artifacts import JsonArtifactRepository as _JAR
+from backend.schemas.state import ReferenceAnalysis as _RA
+
+
+class _RefStub(_R):
+    def invoke(self, i, config=None, **k): raise NotImplementedError
+    def with_structured_output(self, model):
+        class _S(_R):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return _RA(composition="a reference reading")
+        return _S()
+
+
+def _ref_deps():
+    """The two fields every WorkflowDependencies now requires."""
+    return dict(reference_analyzer=_RAA(_RefStub()),
+                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+
+
 REAL = langchain_anthropic.ChatAnthropic
 CALLS = []
 
@@ -29,12 +55,12 @@ import backend.main as m
 from backend.config.settings import get_settings
 svc = m.build_project_service(get_settings())
 
-print("=== 1. Composition root built three clients, one per role ===")
-print("   clients built:", len(CALLS), ok(len(CALLS) == 3))
+print("=== 1. Composition root built four clients, one per role ===")
+print("   clients built:", len(CALLS), ok(len(CALLS) == 4))
 temps = [c["temperature"] for c in CALLS]
 toks = [c["max_tokens"] for c in CALLS]
-print("   temperatures :", temps, ok(temps == [0.0, 0.4, 0.6]))
-print("   max_tokens   :", toks, ok(toks == [4000, 8000, 8000]))
+print("   temperatures :", temps, ok(temps == [0.0, 0.4, 0.6, 0.2]))
+print("   max_tokens   :", toks, ok(toks == [4000, 8000, 8000, 8000]))
 print("   key not echoed in kwargs repr:",
       ok("test-only-not-a-real-key" not in str({k: v for k, v in CALLS[0].items() if k != "api_key"})))
 
@@ -66,7 +92,7 @@ from backend.context.builder import ContextBuilder
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.design_director import DesignDirectorAgent
-g = build_workflow(WorkflowDependencies(
+g = build_workflow(WorkflowDependencies(**_ref_deps(), 
     context_builder=ContextBuilder(),
     requirement_analyzer=RequirementAnalyzerAgent(FakeChat()),
     planner=PlannerAgent(FakeChat()),

@@ -21,6 +21,32 @@ from backend.agents.planner import PlannerAgent
 from backend.agents.design_director import DesignDirectorAgent
 from backend.config.settings import get_settings
 
+# --- WorkflowDependencies gained reference_analysis collaborators ---
+# Self-contained: it must not depend on whatever stub shape this suite uses.
+import tempfile as _tf
+from pathlib import Path as _P
+from langchain_core.runnables import Runnable as _R
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
+from backend.memory.artifacts import JsonArtifactRepository as _JAR
+from backend.schemas.state import ReferenceAnalysis as _RA
+
+
+class _RefStub(_R):
+    def invoke(self, i, config=None, **k): raise NotImplementedError
+    def with_structured_output(self, model):
+        class _S(_R):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return _RA(composition="a reference reading")
+        return _S()
+
+
+def _ref_deps():
+    """The two fields every WorkflowDependencies now requires."""
+    return dict(reference_analyzer=_RAA(_RefStub()),
+                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+
+
 N = {"d": 0}
 
 
@@ -48,7 +74,7 @@ def make_client():
     startup so no model is ever invoked.
     """
     N["d"] = 0
-    g = build_workflow(WorkflowDependencies(
+    g = build_workflow(WorkflowDependencies(**_ref_deps(), 
         context_builder=ContextBuilder(),
         requirement_analyzer=RequirementAnalyzerAgent(FakeChat()),
         planner=PlannerAgent(FakeChat()),

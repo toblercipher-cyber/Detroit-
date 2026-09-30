@@ -75,6 +75,17 @@ def new_checkpoint_id() -> str:
     return f"ckpt_{uuid4().hex}"
 
 
+def new_image_id() -> str:
+    """``img_`` + uuid4 hex — names one uploaded reference image.
+
+    Server-generated, never derived from the client filename. The stored file is
+    named by this id alone, so an upload cannot influence its own path or extension
+    (docs/security.md 4). The repository validates the same shape independently, so
+    containment does not depend on this function being the only minter.
+    """
+    return f"img_{uuid4().hex}"
+
+
 class _Model(BaseModel):
     """Shared base: reject unknown fields so drift surfaces instead of being ignored."""
 

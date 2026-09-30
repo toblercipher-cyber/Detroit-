@@ -71,6 +71,24 @@ WORKSPACE_DIR = "workspace"
 # rather than merely unlikely (docs/security.md 3.4, docs/state.md 5.3).
 _PROJECT_ID_RE = re.compile(r"^proj_[0-9a-f]{32}$")
 
+# Reference image ids are server-generated and never derived from a client
+# filename (docs/security.md 4). Validating the shape here means a stored path can
+# never be influenced by upload content, whatever the upload route does.
+_IMAGE_ID_RE = re.compile(r"^img_[0-9a-f]{32}$")
+
+# Extension per allowlisted type (docs/security.md 4). Derived from the
+# magic-byte-verified type, NEVER from the client filename: the upload names
+# neither the file nor its suffix.
+#
+# A closed table, not mimetypes.guess_extension(): that consults the machine's
+# registry, so the stored filename would depend on the host, and it can return
+# ".jpe" for image/jpeg. Three entries that never surprise are worth more here.
+_EXTENSION_BY_TYPE: dict[str, str] = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/webp": ".webp",
+}
+
 
 class StateRepositoryError(RuntimeError):
     """A persistence operation failed. Messages stay free of absolute paths."""
@@ -97,6 +115,15 @@ class SchemaVersionMismatchError(StateRepositoryError):
     """
 
 
+class ReferenceImageNotFoundError(StateRepositoryError):
+    """No stored reference image with this id under this project.
+
+    Distinct from :class:`ProjectNotFoundError`: the project may be perfectly
+    valid while the image is missing, and the Reference Analysis stage must be able
+    to tell "nothing was uploaded" from "the project does not exist".
+    """
+
+
 class StateRepository(Protocol):
     """The narrow persistence interface the rest of the system depends on.
 
@@ -118,6 +145,39 @@ class StateRepository(Protocol):
 
     def delete(self, project_id: str) -> None:
         """Remove a project and everything under it."""
+
+    def save_reference_image(
+        self, project_id: str, image_id: str, content: bytes, content_type: str
+    ) -> None:
+        """Store raw upload bytes for later vision analysis."""
+
+    def load_reference_image(self, project_id: str, image_id: str) -> bytes:
+        """Return stored bytes, or raise :class:`ReferenceImageNotFoundError`."""
+
+
+def _atomic_write_bytes(path: Path, content: bytes) -> None:
+    """Write ``content`` to ``path`` atomically.
+
+    The byte twin of :func:`_atomic_write_text`, kept separate rather than folding
+    both into one function with a mode flag: image bytes must never pass through a
+    text encoder, and a shared helper is one edit away from doing exactly that.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(handle, "wb") as tmp_file:
+            tmp_file.write(content)
+            tmp_file.flush()
+            os.fsync(tmp_file.fileno())
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        raise StateRepositoryError(
+            f"Could not write artifact '{path.name}' (reason: {exc.strerror})."
+        ) from None
 
 
 def _atomic_write_text(path: Path, content: str) -> None:
@@ -193,6 +253,99 @@ class JsonArtifactRepository:
     def workspace_dir(self, project_id: str) -> Path:
         """Where the generated website for this project is built."""
         return self._project_dir(project_id) / WORKSPACE_DIR
+
+    def _reference_dir_checked(self, project_id: str, image_id: str) -> Path:
+        """The project's reference directory, with the image id validated.
+
+        The id is checked before any path is built, so a malformed value never
+        reaches the filesystem. Containment is then asserted again on the resolved
+        path: an upload identifier is untrusted input and gets the same two-stage
+        treatment as a project id (docs/security.md 3.4).
+        """
+        if not _IMAGE_ID_RE.match(image_id):
+            logger.warning("rejected malformed reference image id")
+            raise ReferenceImageNotFoundError("Unknown reference image.")
+        return self.reference_dir(project_id)
+
+    def _reference_path(
+        self, project_id: str, image_id: str, content_type: str
+    ) -> Path:
+        """Resolve the stored path for one image: ``{image_id}.{ext}``.
+
+        The extension comes from the magic-byte-verified type, never from the
+        client filename (docs/security.md 4). An unknown type cannot produce a
+        path at all, so nothing can be written under an arbitrary suffix.
+        """
+        base = self._reference_dir_checked(project_id, image_id)
+        extension = _EXTENSION_BY_TYPE.get(content_type)
+        if extension is None:
+            logger.warning("rejected reference image with unsupported type")
+            raise ReferenceImageNotFoundError("Unsupported reference image type.")
+
+        candidate = (base / f"{image_id}{extension}").resolve()
+        if not candidate.is_relative_to(base.resolve()):
+            logger.warning("rejected reference path outside the project directory")
+            raise ReferenceImageNotFoundError("Unknown reference image.")
+        return candidate
+
+    def _find_reference_path(self, project_id: str, image_id: str) -> Path:
+        """Locate a stored image by id, whichever allowlisted extension it has.
+
+        A reader knows the id but not necessarily the type, so the extension is
+        discovered rather than required. The candidates are built from the closed
+        extension table — not from a directory glob — so a stray file that happened
+        to share the id prefix could never be selected.
+        """
+        base = self._reference_dir_checked(project_id, image_id)
+        for extension in _EXTENSION_BY_TYPE.values():
+            candidate = base / f"{image_id}{extension}"
+            if candidate.is_file():
+                return candidate
+        raise ReferenceImageNotFoundError("Unknown reference image.")
+
+    # --- Reference images ------------------------------------------------
+
+    def save_reference_image(
+        self, project_id: str, image_id: str, content: bytes, content_type: str
+    ) -> None:
+        """Store raw upload bytes beside the project's state.
+
+        Bytes are stored verbatim and never decoded, re-encoded or parsed here.
+        Size and type are enforced at the upload boundary, which is the only place
+        that has seen the request; this layer's job is containment and durability
+        (docs/security.md 4).
+
+        Args:
+            content_type: the **verified** media type, used only to choose the
+                stored extension. Passing a declared header value here would put
+                the client back in control of the filename.
+        """
+        path = self._reference_path(project_id, image_id, content_type)
+        _atomic_write_bytes(path, content)
+        logger.info(
+            "saved reference image project_id=%s image_id=%s type=%s bytes=%d",
+            project_id,
+            image_id,
+            content_type,
+            len(content),
+        )
+
+    def load_reference_image(self, project_id: str, image_id: str) -> bytes:
+        """Return the stored bytes for one reference image.
+
+        Raises :class:`ReferenceImageNotFoundError` when it is absent, so a caller
+        can distinguish "no reference to analyse" from a real read failure instead
+        of treating every problem as an empty image.
+        """
+        path = self._find_reference_path(project_id, image_id)
+        try:
+            return path.read_bytes()
+        except FileNotFoundError:
+            raise ReferenceImageNotFoundError("Unknown reference image.") from None
+        except OSError as exc:
+            raise StateRepositoryError(
+                f"Could not read reference image (reason: {exc.strerror})."
+            ) from None
 
     # --- StateRepository -------------------------------------------------
 

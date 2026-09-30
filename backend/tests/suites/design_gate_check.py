@@ -15,6 +15,32 @@ from backend.schemas.state import (ProjectState, NormalizedRequirements, Plan,
                                    DesignSpec)
 from backend.schemas.enums import HitlAction, RunStatus, WorkflowStage
 
+# --- WorkflowDependencies gained reference_analysis collaborators ---
+# Self-contained: it must not depend on whatever stub shape this suite uses.
+import tempfile as _tf
+from pathlib import Path as _P
+from langchain_core.runnables import Runnable as _R
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
+from backend.memory.artifacts import JsonArtifactRepository as _JAR
+from backend.schemas.state import ReferenceAnalysis as _RA
+
+
+class _RefStub(_R):
+    def invoke(self, i, config=None, **k): raise NotImplementedError
+    def with_structured_output(self, model):
+        class _S(_R):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return _RA(composition="a reference reading")
+        return _S()
+
+
+def _ref_deps():
+    """The two fields every WorkflowDependencies now requires."""
+    return dict(reference_analyzer=_RAA(_RefStub()),
+                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+
+
 ok = lambda b: "PASS" if b else "**FAIL**"
 
 
@@ -49,7 +75,7 @@ def fresh():
     ra = StubModel(NormalizedRequirements(goal="sell coffee", input_density="sparse"))
     pl = StubModel(Plan(objective="a coffee shop landing page", pages=["/"]))
     dd = StubModel(make_design)
-    deps = WorkflowDependencies(context_builder=ContextBuilder(),
+    deps = WorkflowDependencies(**_ref_deps(), context_builder=ContextBuilder(),
                                 requirement_analyzer=RequirementAnalyzerAgent(ra),
                                 planner=PlannerAgent(pl),
                                 design_director=DesignDirectorAgent(dd))
@@ -60,8 +86,9 @@ print("=== 1. Topology now includes the design stage ===")
 g, _, _ = fresh()
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   expected 5:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
-                                          NODE_DESIGN_GATE, "requirement_analysis"}))
+print("   expected 7:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
+                                          NODE_DESIGN_GATE, "requirement_analysis",
+                                          "reference_analysis", "reference_gate"}))
 
 print()
 print("=== 2. Plan approval now advances to design (not END) ===")

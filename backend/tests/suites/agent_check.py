@@ -11,6 +11,32 @@ from backend.context.builder import ContextBuilder
 from backend.schemas.enums import AgentRole
 from backend.schemas.state import ProjectState, NormalizedRequirements, Plan, DesignSpec
 
+# --- WorkflowDependencies gained reference_analysis collaborators ---
+# Self-contained: it must not depend on whatever stub shape this suite uses.
+import tempfile as _tf
+from pathlib import Path as _P
+from langchain_core.runnables import Runnable as _R
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
+from backend.memory.artifacts import JsonArtifactRepository as _JAR
+from backend.schemas.state import ReferenceAnalysis as _RA
+
+
+class _RefStub(_R):
+    def invoke(self, i, config=None, **k): raise NotImplementedError
+    def with_structured_output(self, model):
+        class _S(_R):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return _RA(composition="a reference reading")
+        return _S()
+
+
+def _ref_deps():
+    """The two fields every WorkflowDependencies now requires."""
+    return dict(reference_analyzer=_RAA(_RefStub()),
+                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+
+
 ok = lambda b: "PASS" if b else "**FAIL**"
 
 class StubStructured(Runnable):
@@ -88,7 +114,7 @@ class ValueModel:
 
 print("=== Graph compiles (checkpointer=None) ===")
 from backend.graph.workflow import build_workflow, WorkflowDependencies
-g = build_workflow(WorkflowDependencies(
+g = build_workflow(WorkflowDependencies(**_ref_deps(), 
         context_builder=ContextBuilder(),
         requirement_analyzer=RequirementAnalyzerAgent(StubModel("good")),
         planner=PlannerAgent(ValueModel(Plan(objective="o"))),

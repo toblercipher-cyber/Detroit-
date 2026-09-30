@@ -41,8 +41,10 @@ from backend.schemas.state import ProjectState
 repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="imgid_")))
 st = ProjectState(user_request="x"); repo.save(st)
 iid = new_image_id()
-repo.save_reference_image(st.project_id, iid, b"\x89PNG\r\n\x1a\nbytes")
+repo.save_reference_image(st.project_id, iid, b"\x89PNG\r\n\x1a\nbytes", "image/png")
 print("   saved + loaded:", ok(repo.load_reference_image(st.project_id, iid)
                                == b"\x89PNG\r\n\x1a\nbytes"))
-print("   filename is the id:",
-      ok([p.name for p in repo.reference_dir(st.project_id).iterdir()] == [iid]))
+# Stored as {image_id}.{ext}, extension from the verified type (security.md 4).
+print("   filename is id + verified ext:",
+      ok([p.name for p in repo.reference_dir(st.project_id).iterdir()]
+         == [iid + ".png"]))

@@ -33,19 +33,41 @@ Spec: docs/api.md 2.2, 5; docs/architecture.md 3.2; docs/security.md 3.4.
 
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, status
+from fastapi import (
+    APIRouter,
+    BackgroundTasks,
+    Depends,
+    File,
+    HTTPException,
+    Request,
+    UploadFile,
+    status,
+)
+from fastapi.responses import Response
 
 from backend.memory.artifacts import InvalidProjectIdError, ProjectNotFoundError
 from backend.schemas.api import (
     CreateProjectRequest,
+    HitlDecisionAccepted,
+    HitlDecisionRequest,
+    HitlHistoryResponse,
     ProjectCreatedResponse,
     ProjectStateResponse,
     ProjectSummary,
     ProjectSummaryList,
+    ReferenceImageResponse,
     StatusResponse,
 )
-from backend.schemas.state import ProjectState
-from backend.services.projects import ProjectBusyError, ProjectService
+from backend.schemas.state import HitlCheckpoint, ProjectState
+from backend.services.projects import (
+    CheckpointAlreadyResolvedError,
+    NoPendingCheckpointError,
+    ProjectBusyError,
+    ProjectService,
+    ProjectServiceError,
+    UnsupportedMediaTypeError,
+    UploadTooLargeError,
+)
 
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
 
@@ -161,6 +183,123 @@ async def get_project_status(
         last_error=state.last_error,
         updated_at=state.updated_at,
     )
+
+
+@router.post(
+    "/{project_id}/reference-images",
+    response_model=ReferenceImageResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def upload_reference_image(
+    project_id: str,
+    file: UploadFile = File(...),
+    service: ProjectService = Depends(get_project_service),
+) -> ReferenceImageResponse:
+    """Attach a reference image for the Reference Analysis stage.
+
+    The uploaded filename is read for nothing. It is not stored, not used as a
+    path component, and not echoed back; the response carries a server-generated
+    id instead (docs/security.md 4).
+
+    ``file.content_type`` is the client's claim and is treated as one: the service
+    confirms it against the file's magic bytes and rejects a disagreement.
+    """
+    _load(service, project_id)
+    content = await file.read()
+    try:
+        ref = service.attach_reference_image(
+            project_id, content, file.content_type or ""
+        )
+    except UploadTooLargeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail=str(exc)
+        ) from None
+    except UnsupportedMediaTypeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE, detail=str(exc)
+        ) from None
+
+    return ReferenceImageResponse(
+        image_id=ref.image_id,
+        content_type=ref.content_type,
+        size_bytes=ref.size_bytes,
+        sha256=ref.sha256,
+        uploaded_at=ref.uploaded_at,
+    )
+
+
+@router.get(
+    "/{project_id}/hitl",
+    response_model=HitlCheckpoint,
+    responses={204: {"description": "No checkpoint is currently pending."}},
+)
+async def get_pending_checkpoint(
+    project_id: str,
+    service: ProjectService = Depends(get_project_service),
+):
+    """The gate the user is being asked to review, or 204 when there is none.
+
+    204 rather than 404: the project exists and "nothing pending" is a normal
+    answer for a client that polls this endpoint (docs/api.md 2.3).
+    """
+    state = _load(service, project_id)
+    if state.pending_checkpoint is None:
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+    return state.pending_checkpoint
+
+
+@router.post(
+    "/{project_id}/hitl",
+    response_model=HitlDecisionAccepted,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def submit_hitl_decision(
+    project_id: str,
+    payload: HitlDecisionRequest,
+    service: ProjectService = Depends(get_project_service),
+) -> HitlDecisionAccepted:
+    """Answer the pending gate and resume the workflow.
+
+    202 rather than 200: the decision is accepted and the graph moves on, but what
+    it produces next is not part of this response (docs/api.md 2.3).
+
+    The action/payload consistency of the body is enforced by the request model, so
+    a malformed decision is a 422 before it reaches here. The two errors below are
+    the ones only the service can detect, and they are distinct on purpose: 409
+    means no gate is open, 410 means this gate is no longer the open one.
+    """
+    _load(service, project_id)
+    try:
+        return await service.submit_hitl_decision(project_id, payload)
+    except NoPendingCheckpointError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+        ) from None
+    except CheckpointAlreadyResolvedError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_410_GONE, detail=str(exc)
+        ) from None
+    except ProjectServiceError:
+        # The service already logged the cause and sanitized the message; re-raising
+        # it verbatim would be the one place a provider or path string could escape.
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="The workflow could not be resumed.",
+        ) from None
+
+
+@router.get("/{project_id}/hitl/history", response_model=HitlHistoryResponse)
+async def get_hitl_history(
+    project_id: str,
+    service: ProjectService = Depends(get_project_service),
+) -> HitlHistoryResponse:
+    """Every decision taken on this project, oldest first.
+
+    Append-only, so this is the audit trail: each record carries the id of the gate
+    the user actually reviewed (docs/state.md 3).
+    """
+    state = _load(service, project_id)
+    return HitlHistoryResponse(history=state.hitl_history)
 
 
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)

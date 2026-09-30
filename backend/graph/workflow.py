@@ -40,6 +40,7 @@ Spec: docs/state.md 3, 4, 5.1; docs/workflow.md 1; docs/architecture.md 3.3, 3.7
 
 from __future__ import annotations
 
+import base64
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -51,8 +52,14 @@ from langgraph.types import interrupt
 from backend.agents.base import AgentFailure, AgentFailureKind
 from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.planner import PlannerAgent
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
-from backend.context.builder import ContextBuilder, ContextPermissionError
+from backend.context.builder import (
+    ContextBuilder,
+    ContextPermissionError,
+    ReferenceImagePayload,
+)
+from backend.memory.artifacts import StateRepository, StateRepositoryError
 from backend.schemas.api import ErrorCode, HitlDecisionRequest
 from backend.schemas.enums import AgentRole, HitlAction, RunStatus, WorkflowStage
 from backend.schemas.state import (
@@ -75,12 +82,15 @@ NODE_PLANNING = WorkflowStage.PLANNING.value
 NODE_PLAN_GATE = "plan_gate"
 NODE_DESIGN = WorkflowStage.DESIGN.value
 NODE_DESIGN_GATE = "design_gate"
+NODE_REFERENCE_ANALYSIS = WorkflowStage.REFERENCE_ANALYSIS.value
+NODE_REFERENCE_GATE = "reference_gate"
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
 _INSTRUCTION_KEYS: dict[WorkflowStage, str] = {
     WorkflowStage.PLANNING: "planning_instruction",
     WorkflowStage.DESIGN: "design_instruction",
+    WorkflowStage.REFERENCE_ANALYSIS: "reference_instruction",
 }
 
 # An agent failure is recorded in state with a stable, safe code. Upstream problems
@@ -108,6 +118,10 @@ class WorkflowDependencies:
     requirement_analyzer: RequirementAnalyzerAgent
     planner: PlannerAgent
     design_director: DesignDirectorAgent
+    reference_analyzer: ReferenceAnalyzerAgent
+    # Reference Analysis needs the image BYTES, which state does not carry;
+    # this is the only reason the graph touches persistence at all.
+    repository: StateRepository
 
 
 def _utcnow() -> datetime:
@@ -273,6 +287,104 @@ async def design_node(state: ProjectState, deps: WorkflowDependencies) -> dict[s
     }
 
 
+async def reference_analysis_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """Read design intent out of an uploaded reference image.
+
+    Owns: ``reference_analysis``. Optional — the router decides whether this runs
+    at all; by the time it does, an image is guaranteed to exist
+    (docs/workflow.md 1).
+
+    THE IMAGE IS LOADED HERE, NOT CARRIED IN STATE
+        ``ProjectState`` holds a ``ReferenceImageRef``: id, type, size, checksum.
+        Analysis needs pixels, and a checksum cannot be looked at. The bytes are
+        read from the repository for this one call and discarded, so base64 never
+        enters ``project_state.json`` (docs/state.md 5.1).
+
+    WHICH IMAGE
+        The most recent upload. Uploading again is how a user replaces a
+        reference, so the newest is the one they mean; the analyzer takes one
+        image and inventing a merge across several would be fabrication.
+
+    The image is untrusted. Text visible inside it is data, never instruction —
+    the agent's own prompt carries that guard (docs/security.md 5).
+    """
+    stage = WorkflowStage.REFERENCE_ANALYSIS
+    refinement = state.node_scratch.get(_INSTRUCTION_KEYS[stage])
+
+    if not state.reference_images:
+        # Unreachable via the router, which checks first. Kept because a node that
+        # is asked for an analysis it cannot ground must refuse rather than invent.
+        return _failure_update(
+            stage,
+            AgentFailure(
+                AgentFailureKind.CONTRACT_VIOLATION,
+                "Reference analysis was reached with no uploaded image.",
+            ),
+        )
+
+    ref = state.reference_images[-1]
+    try:
+        content = deps.repository.load_reference_image(state.project_id, ref.image_id)
+    except StateRepositoryError as exc:
+        logger.warning(
+            "reference image unreadable project_id=%s image_id=%s",
+            state.project_id,
+            ref.image_id,
+        )
+        return _failure_update(
+            stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, str(exc))
+        )
+
+    payload = ReferenceImagePayload(
+        image_id=ref.image_id,
+        content_type=ref.content_type,
+        data_base64=base64.b64encode(content).decode("ascii"),
+    )
+
+    task = (
+        "Describe the design intent visible in this reference image, and how it "
+        "relates to the approved design direction."
+    )
+    if refinement:
+        task = (
+            f"{task}\n\nThe user reviewed your previous reading of this reference "
+            f"and asked for this change, which takes precedence over your earlier "
+            f"output:\n{refinement}"
+        )
+
+    try:
+        context = deps.context_builder.build(
+            state,
+            AgentRole.REFERENCE_ANALYZER,
+            task=task,
+            reference_image=payload,
+        )
+    except ContextPermissionError as exc:
+        return _failure_update(
+            stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, str(exc))
+        )
+
+    result = await deps.reference_analyzer.run(context)
+    if not result.ok:
+        return _failure_update(stage, result.failure)
+
+    logger.info(
+        "reference analysis complete project_id=%s image_id=%s refined=%s",
+        state.project_id,
+        ref.image_id,
+        bool(refinement),
+    )
+    return {
+        "reference_analysis": result.output,
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
 def _gate_node(
     state: ProjectState,
     *,
@@ -294,6 +406,17 @@ def _gate_node(
 
     Requires a checkpointer: ``interrupt()`` resumes by re-running the node, which is
     only possible if the paused run was persisted (docs/state.md 5.1).
+
+    WHICH CHECKPOINT ID GETS RECORDED
+        Resuming re-executes this node from the top, so the ``HitlCheckpoint`` below
+        is rebuilt with a **fresh** id before ``interrupt()`` returns the stored
+        decision. Recording that rebuilt id would file the decision against a gate
+        the user never saw, and the audit trail would not join back to the review.
+
+        The id the user answered survives on the decision itself, so the records use
+        ``decision.checkpoint_id``. It is not taken on trust: the service verifies it
+        against the pending checkpoint before resuming, and a mismatch is rejected as
+        ``checkpoint_already_resolved`` rather than reaching this node.
     """
     checkpoint = HitlCheckpoint(
         stage=stage,
@@ -325,8 +448,11 @@ def _gate_node(
         update["pending_checkpoint"] = checkpoint
         return update
 
+    # The gate the user actually reviewed, not the one rebuilt by this re-execution.
+    answered_id = decision.checkpoint_id
+
     record = HitlRecord(
-        checkpoint_id=checkpoint.checkpoint_id,
+        checkpoint_id=answered_id,
         stage=stage,
         action=decision.action,
         option_id=decision.option_id,
@@ -349,7 +475,7 @@ def _gate_node(
         update["approved_decisions"] = [
             *state.approved_decisions,
             ApprovedDecision(
-                decision_id=checkpoint.checkpoint_id,
+                decision_id=answered_id,
                 stage=stage,
                 statement=f"Approved {result_ref}: {summary}",
                 origin=HitlAction.APPROVE,
@@ -405,6 +531,55 @@ def design_gate_node(state: ProjectState, deps: WorkflowDependencies) -> dict[st
     )
 
 
+def reference_gate_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, Any]:
+    """Review gate for the reference reading.
+
+    Reached only when Reference Analysis actually ran: `docs/workflow.md` 1 makes
+    both the stage and its gate conditional on an uploaded image, so a project
+    without one is never asked to approve an analysis that does not exist.
+    """
+    analysis = state.reference_analysis
+    summary = "A reading of your reference image is ready for review."
+    if analysis is not None:
+        # ReferenceAnalysis has no single headline field — every field is optional
+        # and any subset may be filled. The first populated one, in the order the
+        # model declares them, is the most structural thing the analyzer saw.
+        summary = next(
+            (
+                value
+                for value in (
+                    analysis.composition,
+                    analysis.layout,
+                    analysis.hierarchy,
+                    analysis.typography,
+                )
+                if value
+            ),
+            summary,
+        )
+    return _gate_node(
+        state,
+        stage=WorkflowStage.REFERENCE_ANALYSIS,
+        title="Review the reference interpretation",
+        result_ref="reference_analysis",
+        summary=summary,
+    )
+
+
+def route_after_design_gate(state: ProjectState) -> str:
+    """Approval goes to Reference Analysis only when there is an image to read.
+
+    This is the conditional in `docs/workflow.md` 1. With no upload the stage is
+    skipped **entirely** — not run against nothing, and not stubbed — because an
+    analysis with no image would be invention, and a gate asking the user to
+    approve it would be worse.
+    """
+    decision = route_after_gate(state)
+    if decision == "approved" and not state.reference_images:
+        return "skip_reference"
+    return decision
+
+
 def route_after_gate(state: ProjectState) -> str:
     """Advance on approval, re-run the stage on a revision, stop on a failure.
 
@@ -455,16 +630,25 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     def _design_gate(state: ProjectState) -> dict[str, Any]:
         return design_gate_node(state, deps)
 
+    async def _reference_analysis(state: ProjectState) -> dict[str, Any]:
+        return await reference_analysis_node(state, deps)
+
+    def _reference_gate(state: ProjectState) -> dict[str, Any]:
+        return reference_gate_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
     graph.add_node(NODE_DESIGN, _design)
     graph.add_node(NODE_DESIGN_GATE, _design_gate)
+    graph.add_node(NODE_REFERENCE_ANALYSIS, _reference_analysis)
+    graph.add_node(NODE_REFERENCE_GATE, _reference_gate)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
     graph.add_edge(NODE_PLANNING, NODE_PLAN_GATE)
     graph.add_edge(NODE_DESIGN, NODE_DESIGN_GATE)
+    graph.add_edge(NODE_REFERENCE_ANALYSIS, NODE_REFERENCE_GATE)
 
     # Each gate: approval advances, a revision re-runs its own stage, a failure
     # stops. The router is shared; only the destinations differ.
@@ -477,10 +661,25 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     # The approved design branch terminates for now. `reference_analysis` is next and
     # is conditional on an uploaded image; it is not stubbed, so the graph never
     # claims a stage that has no implementation.
+    # Approval branches on whether a reference image exists. With none, the
+    # Reference stage and its gate are skipped entirely (docs/workflow.md 1).
     graph.add_conditional_edges(
         NODE_DESIGN_GATE,
+        route_after_design_gate,
+        {
+            "approved": NODE_REFERENCE_ANALYSIS,
+            "skip_reference": END,
+            "revise": NODE_DESIGN,
+            "stop": END,
+        },
+    )
+
+    # The approved reference branch terminates for now. `frontend_architecture` is
+    # next; it is not stubbed, so the graph never claims a stage it cannot run.
+    graph.add_conditional_edges(
+        NODE_REFERENCE_GATE,
         route_after_gate,
-        {"approved": END, "revise": NODE_DESIGN, "stop": END},
+        {"approved": END, "revise": NODE_REFERENCE_ANALYSIS, "stop": END},
     )
 
     if checkpointer is None:

@@ -35,7 +35,7 @@ for n in ("save_reference_image", "load_reference_image"):
 
 print()
 print("=== 2. Byte-exact round trip ===")
-repo.save_reference_image(PID, IID, PNG)
+repo.save_reference_image(PID, IID, PNG, "image/png")
 got = repo.load_reference_image(PID, IID)
 print("   bytes identical :", ok(got == PNG))
 print("   length          :", len(got), ok(len(got) == len(PNG)))
@@ -48,12 +48,14 @@ d = repo.reference_dir(PID)
 files = sorted(p.name for p in d.iterdir())
 print("   dir            :", d.parent.name + "/" + d.name,
       ok(d.name == "reference"))
-print("   filename is the id alone:", files, ok(files == [IID]))
-print("   no extension   :", ok("." not in files[0]))
+# {image_id}.{ext} per docs/security.md 4; the extension comes from the
+# magic-byte-verified type, never from any client-supplied filename.
+print("   filename is id + ext:", files, ok(files == [IID + ".png"]))
+print("   extension matches the verified type:", ok(files[0].endswith(".png")))
 
 print()
 print("=== 4. Overwrite is atomic and leaves no temp files ===")
-repo.save_reference_image(PID, IID, b"second version")
+repo.save_reference_image(PID, IID, b"second version", "image/png")
 print("   replaced       :", ok(repo.load_reference_image(PID, IID) == b"second version"))
 leftovers = [p.name for p in d.iterdir() if p.name.startswith(".") or p.name.endswith(".tmp")]
 print("   no temp litter :", leftovers, ok(leftovers == []))
@@ -82,7 +84,7 @@ for bad in ["../../ESCAPED", "..\\..\\ESCAPED", "img_" + "ab" * 16 + "/../../x",
             "img_ABCDEF" + "0" * 26, "img_short", "", "img_" + "ab" * 16 + ".svg",
             "%2e%2e%2fESCAPED", "img_" + "ab" * 15]:
     for fn, label in ((repo.load_reference_image, "load"),
-                      (lambda p, i: repo.save_reference_image(p, i, b"x"), "save")):
+                      (lambda p, i: repo.save_reference_image(p, i, b"x", "image/png"), "save")):
         try:
             fn(PID, bad)
             print("   %-5s %-28s ACCEPTED **FAIL**" % (label, bad[:28]))
@@ -93,7 +95,7 @@ for bad in ["../../ESCAPED", "..\\..\\ESCAPED", "img_" + "ab" * 16 + "/../../x",
 print("   all 9 malformed/traversal ids rejected on both paths:", ok(True))
 print("   nothing escaped the data root:", ok(not outside.exists()))
 print("   reference dir still holds only the one file:",
-      ok(sorted(p.name for p in d.iterdir()) == [IID]))
+      ok(sorted(p.name for p in d.iterdir()) == [IID + ".png"]))
 
 print()
 print("=== 7. Deleting the project removes its images ===")

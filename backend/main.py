@@ -43,9 +43,13 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from langgraph.checkpoint.memory import InMemorySaver
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.agents.base import model_kwargs_for
+from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.planner import PlannerAgent
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.api import projects as projects_routes
 from backend.config.settings import Settings, get_settings
@@ -80,6 +84,33 @@ _STATUS_TO_CODE: dict[int, ErrorCode] = {
     502: ErrorCode.UPSTREAM_ERROR,
     503: ErrorCode.QUALITY_GATE_BLOCKED,
 }
+
+
+def _code_for(exc: BaseException, status_code: int) -> ErrorCode:
+    """The machine-readable code for an error, preferring the one it carries.
+
+    Status alone is ambiguous: 409 is both "no gate is open" and "not valid in this
+    stage", and ``docs/api.md`` 6 gives those different codes. The service errors
+    already know which they are, so their ``code`` wins and the status map is only
+    the fallback.
+
+    The originating error is found through ``__context__`` because a route raises
+    ``HTTPException(...) from None``. That suppresses the *display* of the cause but
+    still attaches the original exception, so the code survives without the route
+    having to restate it — and without this function guessing from a message string.
+
+    Only a real ``ErrorCode`` is honoured, so an arbitrary exception carrying some
+    other ``code`` attribute cannot inject a value into the public envelope.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        candidate = getattr(current, "code", None)
+        if isinstance(candidate, ErrorCode):
+            return candidate
+        current = current.__cause__ or current.__context__
+    return _STATUS_TO_CODE.get(status_code, ErrorCode.INTERNAL_ERROR)
 
 
 def _request_id(request: Request) -> str:
@@ -124,7 +155,10 @@ def build_project_service(settings: Settings) -> ProjectService:
     a test can substitute any piece (CLAUDE.md 29).
 
     The chat model is constructed from the central per-role policy; an agent never
-    assembles its own parameters and never names a model (docs/runtime.md 4.1).
+    assembles its own parameters and never names a model (docs/runtime.md 4.1). Each
+    role gets its own client because the policy differs per role — the Design
+    Director runs at a higher temperature than the Requirement Analyzer, and sharing
+    one client would silently flatten that.
     """
     # Lazy import: the provider SDK is only needed when a real service is built, so
     # importing this module does not require it.
@@ -132,23 +166,49 @@ def build_project_service(settings: Settings) -> ProjectService:
 
     repository = JsonArtifactRepository(settings.builder_data_dir)
 
-    analyzer_model = ChatAnthropic(
-        api_key=settings.anthropic_api_key.get_secret_value(),
-        **model_kwargs_for(
-            AgentRole.REQUIREMENT_ANALYZER,
-            default_model=settings.anthropic_model,
-            heavy_model=settings.anthropic_model_heavy,
-        ),
-    )
+    def model_for(role: AgentRole) -> ChatAnthropic:
+        """A chat client configured by the central policy for one role."""
+        return ChatAnthropic(
+            api_key=settings.anthropic_api_key.get_secret_value(),
+            **model_kwargs_for(
+                role,
+                default_model=settings.anthropic_model,
+                heavy_model=settings.anthropic_model_heavy,
+            ),
+        )
 
     workflow = build_workflow(
         WorkflowDependencies(
             context_builder=ContextBuilder(),
-            requirement_analyzer=RequirementAnalyzerAgent(analyzer_model),
+            requirement_analyzer=RequirementAnalyzerAgent(
+                model_for(AgentRole.REQUIREMENT_ANALYZER)
+            ),
+            planner=PlannerAgent(model_for(AgentRole.PLANNER)),
+            design_director=DesignDirectorAgent(
+                model_for(AgentRole.DESIGN_DIRECTOR)
+            ),
+            reference_analyzer=ReferenceAnalyzerAgent(
+                model_for(AgentRole.REFERENCE_ANALYZER)
+            ),
+            # The same repository the service uses. Reference Analysis needs the
+            # image bytes, which state does not carry; sharing one instance keeps
+            # a single view of what is on disk.
+            repository=repository,
         ),
-        # Not chosen here: the interim checkpointer is an open decision
-        # (docs/state.md 5.1). build_workflow warns that runs are not durable.
-        checkpointer=None,
+        # Interim development checkpointer, chosen by the user and approved as
+        # interim only (docs/state.md 5.1). A checkpointer is not optional, and the
+        # way it fails without one is worth knowing: the first gate still pauses and
+        # still returns __interrupt__, so a run LOOKS fine — but answering it raises
+        # ``RuntimeError: Cannot use Command(resume=...) without checkpointer``.
+        # The gate is reachable and unanswerable, which is the worst of both.
+        #
+        # KNOWN LIMITATION, accepted for development: this store is per-process. A
+        # restart loses every pending HITL gate, which is exactly the restart
+        # survival docs/state.md 5.2 describes. Replacing it with a durable saver is
+        # a one-line change here and touches nothing else — that is the point of
+        # injecting it at the composition root. Supabase/PostgreSQL remains deferred
+        # until the schema is defined (docs/state.md 5.0).
+        checkpointer=InMemorySaver(),
     )
 
     return ProjectService(repository=repository, workflow=workflow, settings=settings)
@@ -249,7 +309,7 @@ def create_app() -> FastAPI:
         request: Request, exc: StarletteHTTPException
     ) -> JSONResponse:
         """Wrap ordinary HTTP errors in the one documented envelope."""
-        code = _STATUS_TO_CODE.get(exc.status_code, ErrorCode.INTERNAL_ERROR)
+        code = _code_for(exc, exc.status_code)
         message = exc.detail if isinstance(exc.detail, str) else "Request failed."
         return _error_response(
             exc.status_code, code, message, _request_id(request)

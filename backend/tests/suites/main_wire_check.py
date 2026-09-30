@@ -54,9 +54,9 @@ print("   policy temps:", temps)
 print("   three distinct values:", ok(len(set(temps.values())) == 3))
 
 print()
-print("=== 6. Graph topology unchanged (5 nodes) ===")
+print("=== 6. Graph topology (7 nodes incl. the reference stage) ===")
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
-print("   nodes:", nodes, ok(len(nodes) == 5))
+print("   nodes:", nodes, ok(len(nodes) == 7))  # + reference_analysis, reference_gate
 
 print()
 print("=== 7. The first HITL gate actually pauses (was impossible with None) ===")
