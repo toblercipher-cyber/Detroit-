@@ -40,6 +40,7 @@ Spec: docs/state.md 3, 4, 5.1; docs/workflow.md 1; docs/architecture.md 3.3, 3.7
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import logging
@@ -54,25 +55,40 @@ from langgraph.types import interrupt
 
 from backend.agents.base import AgentFailure, AgentFailureKind
 from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
+from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.builder import BuilderAgent
+from backend.agents.code_reviewer import CodeReviewerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
+from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.context.builder import (
+    ChangedFilePayload,
     ContextBuilder,
     ContextPermissionError,
     ReferenceImagePayload,
+    RenderedPreviewPayload,
 )
 from backend.memory.artifacts import StateRepository, StateRepositoryError
 from backend.tools.build_runner import BuildRunner
+from backend.tools.impeccable import ImpeccableStatus
 from backend.tools.template import scaffold_workspace
 from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, HitlDecisionRequest
-from backend.schemas.enums import AgentRole, HitlAction, RunStatus, WorkflowStage
+from backend.schemas.enums import (
+    AgentRole,
+    HitlAction,
+    RunStatus,
+    Severity,
+    WorkflowStage,
+)
 from backend.schemas.state import (
     ApprovedDecision,
     BuildStatus,
+    EvaluationFinding,
+    EvaluationReport,
     ErrorBody,
     HitlCheckpoint,
     FileRef,
@@ -98,6 +114,7 @@ NODE_REFERENCE_GATE = "reference_gate"
 NODE_FRONTEND_ARCHITECTURE = WorkflowStage.FRONTEND_ARCHITECTURE.value
 NODE_BUILD = WorkflowStage.BUILD.value
 NODE_PREVIEW = WorkflowStage.PREVIEW.value
+NODE_EVALUATION = WorkflowStage.EVALUATION.value
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
@@ -138,9 +155,25 @@ class WorkflowDependencies:
     # it is built per project rather than shared (backend/agents/builder.py).
     build_builder: Callable[[WorkspaceFiles], BuilderAgent]
     build_runner: BuildRunner
+    visual_ux_critic: VisualUxCriticAgent
+    anti_slop_reviewer: AntiSlopReviewerAgent
+    accessibility_reviewer: AccessibilityReviewerAgent
+    code_reviewer: CodeReviewerAgent
+    # Answers 'is Impeccable installed'. Injected so a test can drive both
+    # outcomes without touching the filesystem (CLAUDE.md 15).
+    impeccable_probe: Callable[[], ImpeccableStatus]
     # Reference Analysis needs the image BYTES, which state does not carry;
     # this is the only reason the graph touches persistence at all.
     repository: StateRepository
+    # Runs the detector. Last because it is the only optional collaborator:
+    # None until Impeccable is installed and its real interface has been
+    # observed, and None means the gate BLOCKS — it never means "skip".
+    impeccable_detector: Callable[[Path], list[EvaluationFinding]] | None = None
+    # Captures the RENDERED preview -- DOM and screenshot -- for the three
+    # reviewers granted it. None until a headless browser is approved; None
+    # means the gate BLOCKS, because a URL is not something an agent can look
+    # at and an unrendered index.html is not evidence.
+    preview_capture: Callable[[Path, str], RenderedPreviewPayload] | None = None
 
 
 def _utcnow() -> datetime:
@@ -627,6 +660,201 @@ def preview_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, A
     }
 
 
+async def evaluation_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """Run the mandatory quality gate, or report honestly that it cannot run.
+
+    Owns: ``evaluation_results``.
+
+    THE GATE IS BLOCKING AND HAS NO SUBSTITUTE
+        ``CLAUDE.md`` 15 and ``docs/design.md`` 5.1 are unusually explicit: if
+        Impeccable is unavailable, STOP and report the gate as blocked. An
+        agent-only review may add interpretation *on top of* Impeccable
+        findings; it may never stand in for them, and a blocked gate is never
+        reported as a pass.
+
+        So this node has two outcomes, and "quietly review with agents instead"
+        is not one of them.
+
+    WHY AVAILABILITY ALONE IS NOT ENOUGH
+        The probe answers "is the tool installed". Running it is a second thing.
+        Until a detector is wired, an installed tool still yields no findings —
+        and reviewers interpreting an empty list would be exactly the agent-only
+        substitute the ruling forbids. Both must hold, so both are checked.
+
+    THE REVIEWERS RUN IN PARALLEL
+        Four independent readings of the same artefact with no ordering between
+        them (``CLAUDE.md`` 6). ``asyncio.gather`` is right here precisely
+        because LangGraph is not: this is fan-out *within* one stage, not a
+        branch in the workflow, so it does not belong in the graph topology.
+
+    FAILURES DO NOT SILENTLY SHRINK THE REVIEW
+        If a reviewer errors, its findings are absent — and a gate that passed
+        because a reviewer crashed would be worse than one that failed. A failed
+        reviewer therefore blocks the gate rather than being dropped.
+    """
+    stage = WorkflowStage.EVALUATION
+    status = deps.impeccable_probe()
+
+    if not status.available:
+        logger.warning(
+            "quality gate BLOCKED project_id=%s reason=%s",
+            state.project_id,
+            status.reason,
+        )
+        return _blocked_gate(state, status.version, status.reason)
+
+    if deps.impeccable_detector is None:
+        # Installed but not wired. Reported as blocked for the same reason:
+        # findings that were never produced cannot be interpreted.
+        reason = "Impeccable is installed but its detector is not wired."
+        logger.warning("quality gate BLOCKED project_id=%s reason=%s",
+                       state.project_id, reason)
+        return _blocked_gate(state, status.version, reason)
+
+    if deps.preview_capture is None:
+        # Three reviewers are granted the RENDERED preview, and
+        # RenderedPreviewPayload refuses a URL alone: a link is not something an
+        # agent can look at. Without capture the only honest inputs would be the
+        # built index.html -- an empty <div id="root"> before React runs -- and
+        # reviewers passing a gate on that would be the substitute the ruling
+        # forbids, dressed up as evidence.
+        reason = "The rendered preview cannot be captured, so it cannot be reviewed."
+        logger.warning("quality gate BLOCKED project_id=%s reason=%s",
+                       state.project_id, reason)
+        return _blocked_gate(state, status.version, reason)
+
+    workspace = deps.repository.workspace_dir(state.project_id)
+    try:
+        detector_findings = deps.impeccable_detector(workspace)
+    except Exception:
+        logger.exception("impeccable detector failed project_id=%s", state.project_id)
+        return _blocked_gate(
+            state, status.version, "The Impeccable detector could not be run."
+        )
+
+    reviews, review_failed = await _run_reviewers(state, deps, detector_findings)
+    findings = [*detector_findings, *reviews]
+
+    if review_failed:
+        return _blocked_gate(
+            state, status.version, "A reviewer failed, so the gate is inconclusive."
+        )
+
+    blocking = [f for f in findings if f.severity is Severity.BLOCKER]
+    report = EvaluationReport(
+        iteration=state.iteration_count,
+        impeccable_available=True,
+        impeccable_version=status.version,
+        gate_status="failed" if blocking else "passed",
+        findings=findings,
+    )
+    logger.info(
+        "evaluation complete project_id=%s gate=%s findings=%d blockers=%d",
+        state.project_id,
+        report.gate_status,
+        len(findings),
+        len(blocking),
+    )
+    return {
+        "evaluation_results": report,
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
+def _blocked_gate(
+    state: ProjectState, version: str | None, reason: str
+) -> dict[str, Any]:
+    """The blocked outcome, recorded so it cannot be mistaken for a result.
+
+    ``EvaluationReport`` enforces the invariant that an unavailable gate cannot
+    be ``passed``; this writes the rest of the picture. ``run_status`` becomes
+    ``BLOCKED`` rather than ``FAILED`` because nothing is broken — a required
+    tool is missing, and the distinction is what tells the user whether to fix
+    code or install something (docs/design.md 5.3).
+    """
+    return {
+        "evaluation_results": EvaluationReport(
+            iteration=state.iteration_count,
+            impeccable_available=False,
+            impeccable_version=version,
+            gate_status="blocked",
+            findings=[],
+        ),
+        "current_stage": WorkflowStage.EVALUATION,
+        "run_status": RunStatus.BLOCKED,
+        "last_error": ErrorBody(
+            code=ErrorCode.QUALITY_GATE_BLOCKED.value, message=reason
+        ),
+        "updated_at": _utcnow(),
+    }
+
+
+async def _run_reviewers(
+    state: ProjectState,
+    deps: WorkflowDependencies,
+    detector_findings: list[EvaluationFinding],
+) -> tuple[list[EvaluationFinding], bool]:
+    """Run the four reviewers concurrently and merge what they return.
+
+    Each gets only what its role is granted: the critic and the accessibility
+    reviewer see the rendered preview, the anti-slop reviewer additionally sees
+    the detector's findings to interpret, and the code reviewer sees changed
+    files and nothing else (docs/agents.md 4.6-4.10).
+
+    Returns the merged findings and whether any reviewer failed.
+    """
+    assert deps.preview_capture is not None  # checked by the caller
+    preview = deps.preview_capture(
+        deps.repository.workspace_dir(state.project_id) / "dist",
+        state.preview_status.preview_url or "",
+    )
+    changed = [
+        ChangedFilePayload(path=ref.path, content="")
+        for ref in state.generated_files
+    ]
+
+    plans: list[tuple[AgentRole, Any, dict[str, Any]]] = [
+        (AgentRole.VISUAL_UX_CRITIC, deps.visual_ux_critic,
+         {"rendered_preview": preview}),
+        (AgentRole.ANTI_SLOP_REVIEWER, deps.anti_slop_reviewer,
+         {"rendered_preview": preview, "findings": detector_findings}),
+        (AgentRole.ACCESSIBILITY_REVIEWER, deps.accessibility_reviewer,
+         {"rendered_preview": preview, "changed_files": changed}),
+        (AgentRole.CODE_REVIEWER, deps.code_reviewer,
+         {"changed_files": changed}),
+    ]
+
+    async def run_one(role: AgentRole, agent: Any, inputs: dict[str, Any]):
+        context = deps.context_builder.build(
+            state, role, task="Review the built result against your remit.", **inputs
+        )
+        return await agent.run(context)
+
+    results = await asyncio.gather(
+        *(run_one(role, agent, inputs) for role, agent, inputs in plans),
+        return_exceptions=True,
+    )
+
+    merged: list[EvaluationFinding] = []
+    failed = False
+    for (role, _, _), result in zip(plans, results):
+        if isinstance(result, BaseException):
+            logger.warning("reviewer raised role=%s: %s", role.value, result)
+            failed = True
+            continue
+        if not result.ok:
+            logger.warning("reviewer failed role=%s", role.value)
+            failed = True
+            continue
+        merged.extend(result.output.findings)
+    return merged, failed
+
+
 def _workspace_manifest(workspace_dir: Path) -> list[FileRef]:
     """Every model-writable file actually present, with its size and checksum.
 
@@ -934,6 +1162,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     def _preview(state: ProjectState) -> dict[str, Any]:
         return preview_node(state, deps)
 
+    async def _evaluation(state: ProjectState) -> dict[str, Any]:
+        return await evaluation_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
@@ -944,6 +1175,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_FRONTEND_ARCHITECTURE, _frontend_architecture)
     graph.add_node(NODE_BUILD, _build)
     graph.add_node(NODE_PREVIEW, _preview)
+    graph.add_node(NODE_EVALUATION, _evaluation)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
@@ -990,7 +1222,11 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     # is BLOCKED on Impeccable (CLAUDE.md 15), so the graph must not claim it.
     graph.add_edge(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
     graph.add_edge(NODE_BUILD, NODE_PREVIEW)
-    graph.add_edge(NODE_PREVIEW, END)
+    graph.add_edge(NODE_PREVIEW, NODE_EVALUATION)
+    # Evaluation terminates whatever it decides. A blocked gate must STOP and be
+    # reported (CLAUDE.md 15); a passing one would advance to Targeted Fix,
+    # which is not stubbed. Either way the graph ends here for now.
+    graph.add_edge(NODE_EVALUATION, END)
 
     if checkpointer is None:
         logger.warning(

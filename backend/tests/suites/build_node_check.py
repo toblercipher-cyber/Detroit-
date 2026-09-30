@@ -23,6 +23,11 @@ from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.context.builder import ContextBuilder
 from backend.memory.artifacts import JsonArtifactRepository
 from backend.tools.build_runner import BuildRunner
+from backend.tools.impeccable import ImpeccableStatus
+from backend.agents.visual_ux_critic import VisualUxCriticAgent
+from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
+from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
+from backend.agents.code_reviewer import CodeReviewerAgent
 from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.enums import RunStatus, WorkflowStage
 from backend.schemas.state import (ProjectState, Plan, DesignSpec, ComponentTree,
@@ -82,6 +87,11 @@ def deps_for(chat, repo, timeout=600):
         frontend_architect=FrontendArchitectAgent(stub),
         build_builder=lambda ws: BuilderAgent(chat, ws),
         build_runner=BuildRunner(timeout_seconds=timeout),
+        visual_ux_critic=VisualUxCriticAgent(stub),
+        anti_slop_reviewer=AntiSlopReviewerAgent(stub),
+        accessibility_reviewer=AccessibilityReviewerAgent(stub),
+        code_reviewer=CodeReviewerAgent(stub),
+        impeccable_probe=lambda: ImpeccableStatus(False, reason='x'),
         repository=repo)
 
 
@@ -240,9 +250,11 @@ from backend.graph.workflow import build_workflow
 g = build_workflow(deps_for(make_chat(GOOD_APP), repo))
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   10 nodes      :", ok(len(nodes) == 10))
+print("   11 nodes      :", ok(len(nodes) == 11))
 print("   preview present:", ok(NODE_PREVIEW in nodes))
 edges = {(e.source, e.target) for e in g.get_graph().edges}
 print("   build -> preview:", ok((NODE_BUILD, NODE_PREVIEW) in edges))
 print("   build no longer -> END:", ok((NODE_BUILD, "__end__") not in edges))
-print("   preview -> END :", ok((NODE_PREVIEW, "__end__") in edges))
+print("   preview -> evaluation:",
+      ok((NODE_PREVIEW, "evaluation") in edges))
+print("   evaluation -> END :", ok(("evaluation", "__end__") in edges))

@@ -28,6 +28,11 @@ from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.builder import BuilderAgent
 from backend.tools.build_runner import BuildRunner
+from backend.tools.impeccable import ImpeccableStatus
+from backend.agents.visual_ux_critic import VisualUxCriticAgent
+from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
+from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
+from backend.agents.code_reviewer import CodeReviewerAgent
 from backend.services.projects import ProjectService
 from backend.schemas.enums import HitlAction, RunStatus, WorkflowStage
 from backend.schemas.api import HitlDecisionRequest
@@ -89,6 +94,11 @@ def build(tmp=None):
         frontend_architect=FrontendArchitectAgent(FakeChat()),
         build_builder=lambda ws: BuilderAgent(FakeChat(), ws),
         build_runner=BuildRunner(timeout_seconds=600),
+        visual_ux_critic=VisualUxCriticAgent(FakeChat()),
+        anti_slop_reviewer=AntiSlopReviewerAgent(FakeChat()),
+        accessibility_reviewer=AccessibilityReviewerAgent(FakeChat()),
+        code_reviewer=CodeReviewerAgent(FakeChat()),
+        impeccable_probe=lambda: ImpeccableStatus(False, reason='x'),
         repository=repo), checkpointer=InMemorySaver())
     svc = ProjectService(repository=repo, workflow=g, settings=get_settings())
     return svc
@@ -107,7 +117,7 @@ print("=== 1. Topology includes the reference stage and its gate ===")
 svc = build()
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   10 nodes       :", ok(len(nodes) == 10))  # + preview
+print("   11 nodes       :", ok(len(nodes) == 11))  # + evaluation
 print("   reference node :", ok(NODE_REFERENCE_ANALYSIS in nodes))
 print("   reference gate :", ok(NODE_REFERENCE_GATE in nodes))
 
@@ -302,6 +312,11 @@ def build_arch():
         frontend_architect=FrontendArchitectAgent(ArchChat()),
         build_builder=lambda ws: BuilderAgent(ArchChat(), ws),
         build_runner=BuildRunner(timeout_seconds=600),
+        visual_ux_critic=VisualUxCriticAgent(FakeChat()),
+        anti_slop_reviewer=AntiSlopReviewerAgent(FakeChat()),
+        accessibility_reviewer=AccessibilityReviewerAgent(FakeChat()),
+        code_reviewer=CodeReviewerAgent(FakeChat()),
+        impeccable_probe=lambda: ImpeccableStatus(False, reason='x'),
         repository=repo), checkpointer=InMemorySaver())
     return ProjectService(repository=repo, workflow=g, settings=get_settings())
 
@@ -317,8 +332,10 @@ print("   [skip path] architecture ran :", ok(a.frontend_architecture is not Non
 print("   [skip path] reference skipped:", ok(a.reference_analysis is None))
 # Architecture, build and preview have no gates, so the run continues through
 # all three and the final stage recorded is preview.
-print("   [skip path] ran on to preview:", a.current_stage.value,
-      ok(a.current_stage is WorkflowStage.PREVIEW))
+# Preview has no gate either, so the run continues into evaluation, which
+# BLOCKS because Impeccable is absent. Blocked is the correct end state here.
+print("   [skip path] ran on to evaluation:", a.current_stage.value,
+      ok(a.current_stage is WorkflowStage.EVALUATION))
 
 # Path B: with a reference image -> approval of the reference gate reaches it.
 svcB = build_arch()
@@ -334,8 +351,8 @@ asyncio.run(svcB.submit_hitl_decision(pidB, HitlDecisionRequest(
     checkpoint_id=b.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
 b2 = svcB.get(pidB)
 print("   [ref path] architecture ran  :", ok(b2.frontend_architecture is not None))
-print("   [ref path] ran on to preview :", b2.current_stage.value,
-      ok(b2.current_stage is WorkflowStage.PREVIEW))
+print("   [ref path] ran on to evaluation:", b2.current_stage.value,
+      ok(b2.current_stage is WorkflowStage.EVALUATION))
 
 print()
 print("=== 12. NO gate after architecture (workflow.md 1 says 'no') ===")

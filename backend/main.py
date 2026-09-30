@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import logging
 import uuid
+from pathlib import Path
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -47,12 +48,16 @@ from langgraph.checkpoint.memory import InMemorySaver
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.agents.base import model_kwargs_for
+from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
+from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.builder import BuilderAgent
+from backend.agents.code_reviewer import CodeReviewerAgent
 from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
+from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.api import preview as preview_routes
 from backend.api import projects as projects_routes
 from backend.config.settings import Settings, get_settings
@@ -60,6 +65,7 @@ from backend.context.builder import ContextBuilder
 from backend.graph.workflow import WorkflowDependencies, build_workflow
 from backend.memory.artifacts import JsonArtifactRepository
 from backend.tools.build_runner import BuildRunner
+from backend.tools.impeccable import probe_impeccable
 from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, ErrorResponse, HealthResponse
 from backend.schemas.enums import AgentRole
@@ -69,6 +75,10 @@ from backend.services.projects import ProjectService
 # Version of the builder backend itself, reported by /health. Unrelated to the
 # version of any project it generates.
 APP_VERSION = "0.1.0"
+
+# The repository root, two levels up from backend/main.py. Used to probe for
+# Impeccable, which installs at the root (docs/design.md 5.2).
+REPO_ROOT = Path(__file__).resolve().parents[1]
 
 API_PREFIX = "/api/v1"
 
@@ -207,6 +217,30 @@ def build_project_service(settings: Settings) -> ProjectService:
             build_runner=BuildRunner(
                 timeout_seconds=settings.preview_build_timeout_seconds
             ),
+            visual_ux_critic=VisualUxCriticAgent(
+                model_for(AgentRole.VISUAL_UX_CRITIC)
+            ),
+            anti_slop_reviewer=AntiSlopReviewerAgent(
+                model_for(AgentRole.ANTI_SLOP_REVIEWER)
+            ),
+            accessibility_reviewer=AccessibilityReviewerAgent(
+                model_for(AgentRole.ACCESSIBILITY_REVIEWER)
+            ),
+            code_reviewer=CodeReviewerAgent(
+                model_for(AgentRole.CODE_REVIEWER)
+            ),
+            # Probed on every evaluation, from the real filesystem. Bound to
+            # the repository root here so no lower layer has to guess where
+            # that is (CLAUDE.md 15).
+            impeccable_probe=lambda: probe_impeccable(REPO_ROOT),
+            # Deliberately absent: Impeccable is not installed, so there is no
+            # real interface to call. The gate blocks rather than passing
+            # (docs/design.md 5.2).
+            impeccable_detector=None,
+            # Also absent: capturing a rendered preview needs a headless
+            # browser, which is a dependency nobody has approved. The gate
+            # blocks rather than reviewing an unrendered page.
+            preview_capture=None,
             # The same repository the service uses. Reference Analysis needs the
             # image bytes, which state does not carry; sharing one instance keeps
             # a single view of what is on disk.

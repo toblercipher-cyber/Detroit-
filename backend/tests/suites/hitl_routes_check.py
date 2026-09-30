@@ -59,11 +59,22 @@ class _RefStub(_R):
 def _ref_deps():
     """Every collaborator WorkflowDependencies requires beyond the core three."""
     from backend.agents.builder import BuilderAgent as _BA
+    from backend.agents.visual_ux_critic import VisualUxCriticAgent as _VC
+    from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent as _AS
+    from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent as _AR
+    from backend.agents.code_reviewer import CodeReviewerAgent as _CR
     from backend.tools.build_runner import BuildRunner as _BR
+    from backend.tools.impeccable import ImpeccableStatus as _IS
     return dict(reference_analyzer=_RAA(_RefStub()),
                 frontend_architect=_FAA(_RefStub()),
                 build_builder=lambda ws: _BA(_RefStub(), ws),
                 build_runner=_BR(timeout_seconds=600),
+                visual_ux_critic=_VC(_RefStub()),
+                anti_slop_reviewer=_AS(_RefStub()),
+                accessibility_reviewer=_AR(_RefStub()),
+                code_reviewer=_CR(_RefStub()),
+                # Blocked, which is the real state of this repository.
+                impeccable_probe=lambda: _IS(False, reason="not installed"),
                 repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
 
 
