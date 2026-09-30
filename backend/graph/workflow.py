@@ -41,9 +41,12 @@ Spec: docs/state.md 3, 4, 5.1; docs/workflow.md 1; docs/architecture.md 3.3, 3.7
 from __future__ import annotations
 
 import base64
+import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from langgraph.graph import END, START, StateGraph
@@ -51,6 +54,7 @@ from langgraph.types import interrupt
 
 from backend.agents.base import AgentFailure, AgentFailureKind
 from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.builder import BuilderAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
@@ -61,12 +65,17 @@ from backend.context.builder import (
     ReferenceImagePayload,
 )
 from backend.memory.artifacts import StateRepository, StateRepositoryError
+from backend.tools.build_runner import BuildRunner
+from backend.tools.template import scaffold_workspace
+from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, HitlDecisionRequest
 from backend.schemas.enums import AgentRole, HitlAction, RunStatus, WorkflowStage
 from backend.schemas.state import (
     ApprovedDecision,
+    BuildStatus,
     ErrorBody,
     HitlCheckpoint,
+    FileRef,
     HitlRecord,
     ProjectState,
 )
@@ -86,6 +95,7 @@ NODE_DESIGN_GATE = "design_gate"
 NODE_REFERENCE_ANALYSIS = WorkflowStage.REFERENCE_ANALYSIS.value
 NODE_REFERENCE_GATE = "reference_gate"
 NODE_FRONTEND_ARCHITECTURE = WorkflowStage.FRONTEND_ARCHITECTURE.value
+NODE_BUILD = WorkflowStage.BUILD.value
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
@@ -122,6 +132,10 @@ class WorkflowDependencies:
     design_director: DesignDirectorAgent
     reference_analyzer: ReferenceAnalyzerAgent
     frontend_architect: FrontendArchitectAgent
+    # A factory, not an agent: the Builder holds a handle to ONE workspace, so
+    # it is built per project rather than shared (backend/agents/builder.py).
+    build_builder: Callable[[WorkspaceFiles], BuilderAgent]
+    build_runner: BuildRunner
     # Reference Analysis needs the image BYTES, which state does not carry;
     # this is the only reason the graph touches persistence at all.
     repository: StateRepository
@@ -457,6 +471,149 @@ async def frontend_architecture_node(
     }
 
 
+async def build_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, Any]:
+    """Write the approved architecture into a workspace and compile it.
+
+    Owns: ``generated_files`` and ``build_status``. No gate after it
+    (``docs/workflow.md`` 1) — nothing here is a decision the user makes; a build
+    either compiles or it does not, and what they review is the preview.
+
+    THREE THINGS HAPPEN, IN THIS ORDER
+        1. Scaffold. Builder-owned config is rewritten every time, so a model that
+           somehow altered one does not get to build against its own version
+           (docs/architecture.md 5.2).
+        2. The Builder agent writes under ``src/``. It holds a handle to this one
+           workspace and can express nothing outside it.
+        3. The toolchain runs: install, typecheck, build. Real exit codes decide.
+
+    A FAILED BUILD IS A RESULT, NOT AN EXCEPTION
+        Generated code failing to compile is the ordinary case this pipeline
+        exists to detect and fix. It is recorded in ``build_status`` with a
+        sanitized message so the Fixer has something to act on, and the stage is
+        marked failed so the workflow stops rather than previewing nothing
+        (CLAUDE.md 26).
+
+    WHAT IS RECORDED IS WHAT HAPPENED
+        ``generated_files`` comes from the writes the workspace tool actually
+        performed, not from what the model said it wrote. The agent's own
+        ``BuildResult`` is assembled the same way, which is why the two cannot
+        disagree.
+    """
+    stage = WorkflowStage.BUILD
+    started = _utcnow()
+    workspace_dir = deps.repository.workspace_dir(state.project_id)
+
+    try:
+        scaffold_workspace(workspace_dir)
+    except OSError as exc:
+        logger.error("scaffold failed project_id=%s: %s", state.project_id, exc.strerror)
+        return _build_failure(
+            stage, started, "build", "The project workspace could not be prepared."
+        )
+
+    workspace = WorkspaceFiles(workspace_dir)
+
+    try:
+        context = deps.context_builder.build(
+            state,
+            AgentRole.BUILDER,
+            task=(
+                "Implement the approved component architecture in this workspace, "
+                "following the approved design system."
+            ),
+        )
+    except ContextPermissionError as exc:
+        return _failure_update(
+            stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, str(exc))
+        )
+
+    result = await deps.build_builder(workspace).run(context)
+    if not result.ok:
+        return _failure_update(stage, result.failure)
+
+    written = result.output
+    logger.info(
+        "builder wrote project_id=%s created=%d modified=%d",
+        state.project_id,
+        len(written.files_written),
+        len(written.files_modified),
+    )
+
+    outcome = deps.build_runner.run(workspace_dir)
+
+    # Recorded from the filesystem, not from the agent's claim: the manifest has to
+    # describe what is actually there for Preview and the reviewers to be honest.
+    generated = _workspace_manifest(workspace_dir)
+
+    if not outcome.ok:
+        update = _build_failure(
+            stage, started, outcome.failed_step or "build", outcome.message
+        )
+        update["generated_files"] = generated
+        return update
+
+    return {
+        "generated_files": generated,
+        "build_status": BuildStatus(
+            status="succeeded",
+            step="build",
+            started_at=started,
+            finished_at=_utcnow(),
+        ),
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
+def _workspace_manifest(workspace_dir: Path) -> list[FileRef]:
+    """Every model-writable file actually present, with its size and checksum.
+
+    Only ``src/`` is walked. Builder-owned config is identical in every project by
+    definition, and ``node_modules`` and ``dist`` are generated output — listing
+    either would bury the generated site in thousands of irrelevant entries.
+    """
+    src = workspace_dir / "src"
+    if not src.is_dir():
+        return []
+
+    refs: list[FileRef] = []
+    for path in sorted(p for p in src.rglob("*") if p.is_file()):
+        data = path.read_bytes()
+        refs.append(
+            FileRef(
+                path=path.relative_to(workspace_dir).as_posix(),
+                size_bytes=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+            )
+        )
+    return refs
+
+
+def _build_failure(
+    stage: WorkflowStage, started: datetime, step: str, message: str
+) -> dict[str, Any]:
+    """Record a build failure in both ``build_status`` and the stage error.
+
+    Two places because they answer different questions: ``build_status`` says
+    which step broke, and ``last_error`` is what the API surfaces. The message is
+    already sanitized by the runner; nothing raw reaches either
+    (docs/architecture.md 5.5).
+    """
+    update = _failure_update(
+        stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, message)
+    )
+    update["build_status"] = BuildStatus(
+        status="failed",
+        step=step,
+        started_at=started,
+        finished_at=_utcnow(),
+        error=ErrorBody(code=ErrorCode.BUILD_FAILED.value, message=message),
+    )
+    return update
+
+
 def _gate_node(
     state: ProjectState,
     *,
@@ -711,6 +868,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     async def _frontend_architecture(state: ProjectState) -> dict[str, Any]:
         return await frontend_architecture_node(state, deps)
 
+    async def _build(state: ProjectState) -> dict[str, Any]:
+        return await build_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
@@ -719,6 +879,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_REFERENCE_ANALYSIS, _reference_analysis)
     graph.add_node(NODE_REFERENCE_GATE, _reference_gate)
     graph.add_node(NODE_FRONTEND_ARCHITECTURE, _frontend_architecture)
+    graph.add_node(NODE_BUILD, _build)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
@@ -760,10 +921,11 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
         },
     )
 
-    # Architecture has no gate (docs/workflow.md 1), so it runs straight through.
-    # It terminates for now: `build` is next and is not stubbed, so the graph
-    # never claims a stage it cannot run.
-    graph.add_edge(NODE_FRONTEND_ARCHITECTURE, END)
+    # Neither architecture nor build has a gate (docs/workflow.md 1), so they run
+    # straight through. Build terminates for now: `preview` is next and is not
+    # stubbed, so the graph never claims a stage it cannot run.
+    graph.add_edge(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
+    graph.add_edge(NODE_BUILD, END)
 
     if checkpointer is None:
         logger.warning(

@@ -47,6 +47,7 @@ from langgraph.checkpoint.memory import InMemorySaver
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from backend.agents.base import model_kwargs_for
+from backend.agents.builder import BuilderAgent
 from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
@@ -57,6 +58,8 @@ from backend.config.settings import Settings, get_settings
 from backend.context.builder import ContextBuilder
 from backend.graph.workflow import WorkflowDependencies, build_workflow
 from backend.memory.artifacts import JsonArtifactRepository
+from backend.tools.build_runner import BuildRunner
+from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, ErrorResponse, HealthResponse
 from backend.schemas.enums import AgentRole
 from backend.schemas.state import ErrorBody
@@ -193,6 +196,15 @@ def build_project_service(settings: Settings) -> ProjectService:
             ),
             frontend_architect=FrontendArchitectAgent(
                 model_for(AgentRole.FRONTEND_ARCHITECT)
+            ),
+            # A factory: the Builder is bound to one project workspace, so the
+            # graph constructs it per run. The model is still built here, from
+            # the same central policy as every other role.
+            build_builder=lambda workspace: BuilderAgent(
+                model_for(AgentRole.BUILDER), workspace
+            ),
+            build_runner=BuildRunner(
+                timeout_seconds=settings.preview_build_timeout_seconds
             ),
             # The same repository the service uses. Reference Analysis needs the
             # image bytes, which state does not carry; sharing one instance keeps

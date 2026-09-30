@@ -146,6 +146,15 @@ class StateRepository(Protocol):
     def delete(self, project_id: str) -> None:
         """Remove a project and everything under it."""
 
+    def workspace_dir(self, project_id: str) -> Path:
+        """Where this project's generated website is built.
+
+        On the interface because the Build stage needs a directory to scaffold and
+        compile in, and it must not know how projects are laid out on disk. The
+        Postgres implementation returns a local working directory for the same
+        reason: a build needs a filesystem whatever the state store is.
+        """
+
     def save_reference_image(
         self, project_id: str, image_id: str, content: bytes, content_type: str
     ) -> None:

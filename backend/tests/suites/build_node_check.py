@@ -1,0 +1,181 @@
+"""The Build node: scaffold -> Builder writes src/ -> real toolchain compiles it.
+
+The stub model issues genuine write_workspace_file tool calls, and the REAL
+BuildRunner compiles the result. So this proves the whole path: a file "written by
+the model" actually builds.
+"""
+import os, sys, json, tempfile, asyncio
+from pathlib import Path
+sys.path.insert(0, os.getcwd()); sys.dont_write_bytecode = True
+ok = lambda b: "PASS" if b else "**FAIL**"
+os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
+
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import Runnable
+
+from backend.graph.workflow import build_node, WorkflowDependencies, _workspace_manifest
+from backend.agents.builder import BuilderAgent
+from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
+from backend.agents.planner import PlannerAgent
+from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
+from backend.agents.frontend_architect import FrontendArchitectAgent
+from backend.context.builder import ContextBuilder
+from backend.memory.artifacts import JsonArtifactRepository
+from backend.tools.build_runner import BuildRunner
+from backend.tools.workspace import WorkspaceFiles
+from backend.schemas.enums import RunStatus, WorkflowStage
+from backend.schemas.state import (ProjectState, Plan, DesignSpec, ComponentTree,
+                                   ComponentNode, FrontendArchitecture, BuildResult)
+
+GOOD_APP = (
+    "export default function App() {\n"
+    '  return <main className="p-8"><h1>Coffee</h1></main>;\n'
+    "}\n"
+)
+BAD_APP = (
+    "export default function App() {\n"
+    '  const n: number = "not a number";\n'
+    "  return <main>{n}</main>;\n"
+    "}\n"
+)
+
+
+def make_chat(app_source, extra_writes=()):
+    """A model that issues one real write tool call, then stops."""
+    class Chat(Runnable):
+        def __init__(self, **kw): self.calls = 0
+        def invoke(self, i, config=None, **k): raise NotImplementedError
+        def bind_tools(self, tools):
+            outer = self
+            class _T(Runnable):
+                def invoke(s, i, config=None, **k): raise NotImplementedError
+                async def ainvoke(s, i, config=None, **k):
+                    outer.calls += 1
+                    if outer.calls == 1:
+                        writes = [{"name": "write_workspace_file",
+                                   "args": {"path": "src/App.tsx", "content": app_source},
+                                   "id": "c0", "type": "tool_call"}]
+                        for n, (p, c) in enumerate(extra_writes, start=1):
+                            writes.append({"name": "write_workspace_file",
+                                           "args": {"path": p, "content": c},
+                                           "id": f"c{n}", "type": "tool_call"})
+                        return AIMessage(content="", tool_calls=writes)
+                    return AIMessage(content="done")
+            return _T()
+        def with_structured_output(self, model):
+            class _S(Runnable):
+                def invoke(s, i, config=None, **k): raise NotImplementedError
+                async def ainvoke(s, i, config=None, **k): return model()
+            return _S()
+    return Chat()
+
+
+def deps_for(chat, repo, timeout=600):
+    stub = make_chat(GOOD_APP)
+    return WorkflowDependencies(
+        context_builder=ContextBuilder(),
+        requirement_analyzer=RequirementAnalyzerAgent(stub),
+        planner=PlannerAgent(stub),
+        design_director=DesignDirectorAgent(stub),
+        reference_analyzer=ReferenceAnalyzerAgent(stub),
+        frontend_architect=FrontendArchitectAgent(stub),
+        build_builder=lambda ws: BuilderAgent(chat, ws),
+        build_runner=BuildRunner(timeout_seconds=timeout),
+        repository=repo)
+
+
+def ready_state(repo):
+    st = ProjectState(user_request="a coffee shop landing page")
+    st.plan = Plan(objective="a coffee shop landing page", pages=["/"])
+    st.design_spec = DesignSpec(font_families=["Inter"], visual_tone="warm")
+    st.frontend_architecture = FrontendArchitecture(
+        pages=["/"], component_tree=ComponentTree(root=[ComponentNode(name="App")]))
+    st.component_tree = st.frontend_architecture.component_tree
+    repo.save(st)
+    return st
+
+
+print("=== 1. Happy path: model writes, real toolchain compiles ===")
+repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_ok_")))
+st = ready_state(repo)
+chat = make_chat(GOOD_APP)
+out = asyncio.run(build_node(st, deps_for(chat, repo)))
+ws = repo.workspace_dir(st.project_id)
+
+print("   run_status RUNNING:", out["run_status"].value,
+      ok(out["run_status"] is RunStatus.RUNNING))
+print("   stage BUILD       :", ok(out["current_stage"] is WorkflowStage.BUILD))
+bs = out["build_status"]
+print("   build succeeded   :", bs.status, ok(bs.status == "succeeded"))
+print("   timestamps set    :", ok(bs.started_at is not None and bs.finished_at is not None))
+print("   no error recorded :", ok(bs.error is None))
+print("   dist/ produced    :", ok((ws / "dist" / "index.html").is_file()))
+
+print()
+print("=== 2. The model's file is really on disk and really compiled ===")
+written = (ws / "src" / "App.tsx").read_text(encoding="utf-8")
+print("   App.tsx is the model's:", ok(written == GOOD_APP))
+bundle = list((ws / "dist" / "assets").glob("*.js"))
+print("   bundle emitted        :", ok(len(bundle) == 1))
+print("   model's text in bundle:", ok("Coffee" in bundle[0].read_text(encoding="utf-8")))
+
+print()
+print("=== 3. generated_files is observed from disk, not claimed ===")
+gen = out["generated_files"]
+paths = sorted(f.path for f in gen)
+print("   paths:", paths)
+print("   only src/ listed :", ok(all(p.startswith("src/") for p in gen and paths)))
+print("   no node_modules  :", ok(not any("node_modules" in p for p in paths)))
+print("   no dist          :", ok(not any(p.startswith("dist") for p in paths)))
+print("   no builder config:", ok(not any("package.json" in p or "vite" in p for p in paths)))
+app = next(f for f in gen if f.path == "src/App.tsx")
+import hashlib
+print("   size is real     :", ok(app.size_bytes == len(GOOD_APP.encode())))
+print("   sha256 is real   :", ok(app.sha256 == hashlib.sha256(GOOD_APP.encode()).hexdigest()))
+
+print()
+print("=== 4. Builder-owned config was scaffolded, not left to the model ===")
+for name in ("package.json", "vite.config.ts", "tailwind.config.ts", "tsconfig.json"):
+    print("   %-20s present: %s" % (name, ok((ws / name).is_file())))
+pkg = json.loads((ws / "package.json").read_text(encoding="utf-8"))
+print("   deps come from the allowlist:", ok("react" in pkg["dependencies"]))
+
+print()
+print("=== 5. Scaffold overwrites a tampered config before building ===")
+(ws / "vite.config.ts").write_text("// tampered by something\n", encoding="utf-8")
+st2 = repo.load(st.project_id)
+st2.frontend_architecture = st.frontend_architecture
+asyncio.run(build_node(st2, deps_for(make_chat(GOOD_APP), repo)))
+print("   tampered config restored:",
+      ok("tampered" not in (ws / "vite.config.ts").read_text(encoding="utf-8")))
+
+print()
+print("=== 6. A type error fails the stage and is recorded, not raised ===")
+repo2 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_bad_")))
+stb = ready_state(repo2)
+outb = asyncio.run(build_node(stb, deps_for(make_chat(BAD_APP), repo2)))
+print("   run_status FAILED :", outb["run_status"].value,
+      ok(outb["run_status"] is RunStatus.FAILED))
+bsb = outb["build_status"]
+print("   build_status failed:", bsb.status, ok(bsb.status == "failed"))
+print("   step named        :", bsb.step, ok(bsb.step == "typecheck"))
+print("   error code        :", bsb.error.code, ok(bsb.error.code == "build_failed"))
+print("   message sanitized :", repr(bsb.error.message),
+      ok(os.sep not in bsb.error.message and "Admin" not in bsb.error.message))
+print("   files still recorded:", ok(len(outb["generated_files"]) > 0))
+print("   last_error set    :", ok(outb.get("last_error") is not None))
+
+print()
+print("=== 7. Manifest helper ignores everything it should ===")
+w = Path(tempfile.mkdtemp(prefix="bn_man_"))
+(w / "src" / "nested").mkdir(parents=True)
+(w / "src" / "a.tsx").write_text("a", encoding="utf-8")
+(w / "src" / "nested" / "b.css").write_text("bb", encoding="utf-8")
+(w / "package.json").write_text("{}", encoding="utf-8")
+(w / "dist").mkdir(); (w / "dist" / "x.js").write_text("x", encoding="utf-8")
+(w / "node_modules").mkdir(); (w / "node_modules" / "y.js").write_text("y", encoding="utf-8")
+m = sorted(f.path for f in _workspace_manifest(w))
+print("   manifest:", m, ok(m == ["src/a.tsx", "src/nested/b.css"]))
+print("   posix separators:", ok(all("\\\\" not in p for p in m)))
+print("   empty workspace -> []:", ok(_workspace_manifest(Path(tempfile.mkdtemp())) == []))

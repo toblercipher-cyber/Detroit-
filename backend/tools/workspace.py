@@ -59,7 +59,18 @@ WRITABLE_PREFIXES: tuple[str, ...] = ("src/",)
 # the cost of the check is nothing and the cost of forgetting it, if the writable set
 # ever widens, is a model that can edit the build.
 PROTECTED_NAMES: frozenset[str] = frozenset(
-    {"package.json", "vite.config.ts", "index.html"}
+    {
+        "package.json",
+        "vite.config.ts",
+        "index.html",
+        # Executed during the build exactly like vite.config.ts: Tailwind and
+        # PostCSS import and run their config files, so a model able to write one
+        # could run code at build time. They arrived with the project template
+        # (backend/tools/template.py) and must be listed here for the same reason
+        # the others are.
+        "tailwind.config.ts",
+        "postcss.config.js",
+    }
 )
 PROTECTED_PREFIX = "tsconfig"
 PROTECTED_SUFFIX = ".json"
@@ -169,7 +180,13 @@ class WorkspaceFiles:
         target = self._resolve(path)
         try:
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
+            # newline="\n" is not cosmetic. Without it Python translates "\n" to
+            # "\r\n" on Windows, so the same generated project would have
+            # different bytes -- and different FileRef.sha256 values -- depending
+            # on the machine that built it. Preview freshness compares those
+            # checksums (docs/architecture.md 5.4), so platform-dependent hashes
+            # would make "has this file changed?" unanswerable.
+            target.write_text(content, encoding="utf-8", newline="\n")
         except OSError as exc:
             raise WorkspaceAccessError(
                 f"Could not write {path!r} (reason: {exc.strerror})."

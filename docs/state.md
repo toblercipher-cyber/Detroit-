@@ -147,7 +147,7 @@ Do not design a schema in advance, and do not assume table shapes.
 
 | Layer | What | Where | Purpose |
 |---|---|---|---|
-| **Checkpointer** | LangGraph graph checkpoints, including pending interrupts | local checkpoint store under `BUILDER_DATA_DIR` | correctness — lets an interrupted run resume exactly where it paused |
+| **Checkpointer** | LangGraph graph checkpoints, including pending interrupts | `InMemorySaver` — **process memory, not disk** | correctness — lets an interrupted run resume exactly where it paused, for as long as the process lives |
 | **Artifacts** | Human-readable structured state | `var/projects/{project_id}/*.json` | auditability — inspectable, diffable, matches `CLAUDE.md` §9 |
 
 Both are interim and migrate to Supabase/PostgreSQL once the schema exists. The
@@ -178,13 +178,36 @@ Rules:
   frontend-first rule for *generated* websites (`skills.md` §7, §22). The generated
   website still gets no database, auth or backend.
 
-> **Open decision (blocking for durable HITL):** which interim checkpointer to use
-> before the Supabase schema is defined. In-memory checkpointing works for early
-> development but **loses pending HITL gates on restart**, which contradicts §5.2. A
-> durable local checkpointer requires one additional dependency. Either choice needs
-> user approval; neither may be assumed. See `docs/runtime.md` §2.1.
+#### Checkpointer: decided, with a known limitation
+
+**Decided:** the interim checkpointer is LangGraph's **`InMemorySaver`**, wired at the
+composition root in `backend/main.py`. It ships inside `langgraph`, so it adds no
+dependency.
+
+A checkpointer is **not optional**, and the way it fails without one is worth
+recording: the first gate still pauses and still returns `__interrupt__`, so a run
+*looks* healthy — but answering it raises
+`RuntimeError: Cannot use Command(resume=...) without checkpointer`. The gate is
+reachable and unanswerable.
+
+**Known limitation, accepted for development:** `InMemorySaver` is per-process. A
+restart **loses every pending HITL gate**, so §5.2 below describes the target
+behaviour rather than current behaviour. Until a durable saver is wired, a restart
+means in-flight projects cannot be resumed and must be started again.
+
+This is interim only. Replacing it is a one-line change at the composition root and
+touches nothing else — which is the reason it is injected there rather than
+constructed inside `build_workflow`. The durable choice is deferred with the rest of
+Supabase/PostgreSQL (§5.0), and a local durable saver remains an option if durability
+is needed before the schema exists; either requires one additional dependency and
+explicit approval. See `docs/runtime.md` §2.1.
 
 ### 5.2 Surviving a process restart
+
+> **Target behaviour, not current behaviour.** This section describes what a durable
+> checkpointer must deliver. The interim `InMemorySaver` (§5.1) does **not**: it is
+> per-process, so a restart drops every pending gate. Treat this as the contract the
+> durable saver has to satisfy, and do not write code that assumes it holds today.
 
 ```text
 restart

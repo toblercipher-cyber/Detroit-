@@ -26,6 +26,8 @@ from backend.agents.planner import PlannerAgent
 from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
+from backend.agents.builder import BuilderAgent
+from backend.tools.build_runner import BuildRunner
 from backend.services.projects import ProjectService
 from backend.schemas.enums import HitlAction, RunStatus, WorkflowStage
 from backend.schemas.api import HitlDecisionRequest
@@ -43,6 +45,13 @@ SEEN = {"prompt": None}
 class FakeChat(Runnable):
     def __init__(self, **kw): pass
     def invoke(self, i, config=None, **k): raise NotImplementedError
+    def bind_tools(self, tools):
+        from langchain_core.messages import AIMessage
+        class _T(Runnable):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return AIMessage(content="no changes needed")
+        return _T()
     def with_structured_output(self, model):
         def make():
             if model is NormalizedRequirements:
@@ -78,6 +87,8 @@ def build(tmp=None):
         design_director=DesignDirectorAgent(FakeChat()),
         reference_analyzer=ReferenceAnalyzerAgent(FakeChat()),
         frontend_architect=FrontendArchitectAgent(FakeChat()),
+        build_builder=lambda ws: BuilderAgent(FakeChat(), ws),
+        build_runner=BuildRunner(timeout_seconds=600),
         repository=repo), checkpointer=InMemorySaver())
     svc = ProjectService(repository=repo, workflow=g, settings=get_settings())
     return svc
@@ -96,7 +107,7 @@ print("=== 1. Topology includes the reference stage and its gate ===")
 svc = build()
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   8 nodes        :", ok(len(nodes) == 8))  # + frontend_architecture
+print("   9 nodes        :", ok(len(nodes) == 9))  # + build
 print("   reference node :", ok(NODE_REFERENCE_ANALYSIS in nodes))
 print("   reference gate :", ok(NODE_REFERENCE_GATE in nodes))
 
@@ -289,6 +300,8 @@ def build_arch():
         design_director=DesignDirectorAgent(ArchChat()),
         reference_analyzer=ReferenceAnalyzerAgent(ArchChat()),
         frontend_architect=FrontendArchitectAgent(ArchChat()),
+        build_builder=lambda ws: BuilderAgent(ArchChat(), ws),
+        build_runner=BuildRunner(timeout_seconds=600),
         repository=repo), checkpointer=InMemorySaver())
     return ProjectService(repository=repo, workflow=g, settings=get_settings())
 
@@ -302,8 +315,10 @@ asyncio.run(svcA.submit_hitl_decision(pidA, HitlDecisionRequest(
 a = svcA.get(pidA)
 print("   [skip path] architecture ran :", ok(a.frontend_architecture is not None))
 print("   [skip path] reference skipped:", ok(a.reference_analysis is None))
-print("   [skip path] stage reached    :", a.current_stage.value,
-      ok(a.current_stage is WorkflowStage.FRONTEND_ARCHITECTURE))
+# Architecture has no gate, so the run continues straight into build and the
+# final stage recorded is build, not frontend_architecture.
+print("   [skip path] ran on into build:", a.current_stage.value,
+      ok(a.current_stage is WorkflowStage.BUILD))
 
 # Path B: with a reference image -> approval of the reference gate reaches it.
 svcB = build_arch()
@@ -319,8 +334,8 @@ asyncio.run(svcB.submit_hitl_decision(pidB, HitlDecisionRequest(
     checkpoint_id=b.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
 b2 = svcB.get(pidB)
 print("   [ref path] architecture ran  :", ok(b2.frontend_architecture is not None))
-print("   [ref path] stage reached     :", b2.current_stage.value,
-      ok(b2.current_stage is WorkflowStage.FRONTEND_ARCHITECTURE))
+print("   [ref path] ran on into build :", b2.current_stage.value,
+      ok(b2.current_stage is WorkflowStage.BUILD))
 
 print()
 print("=== 12. NO gate after architecture (workflow.md 1 says 'no') ===")

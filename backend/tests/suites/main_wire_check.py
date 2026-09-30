@@ -54,9 +54,9 @@ print("   policy temps:", temps)
 print("   three distinct values:", ok(len(set(temps.values())) == 3))
 
 print()
-print("=== 6. Graph topology (8 nodes through frontend_architecture) ===")
+print("=== 6. Graph topology (9 nodes through build) ===")
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
-print("   nodes:", nodes, ok(len(nodes) == 8))  # + frontend_architecture
+print("   nodes:", nodes, ok(len(nodes) == 9))  # + build
 
 print()
 print("=== 7. The first HITL gate actually pauses (was impossible with None) ===")

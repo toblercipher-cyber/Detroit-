@@ -38,11 +38,26 @@ class _RefStub(_R):
                 return model()
         return _S()
 
+    def bind_tools(self, tools):
+        # The Builder is a tool-calling agent. This stub writes nothing and
+        # returns immediately, which is enough for the topology tests here --
+        # build_runner_check covers the real compile path.
+        from langchain_core.messages import AIMessage
+        class _T(_R):
+            def invoke(s, i, config=None, **k): raise NotImplementedError
+            async def ainvoke(s, i, config=None, **k):
+                return AIMessage(content="no changes needed")
+        return _T()
+
 
 def _ref_deps():
-    """The two fields every WorkflowDependencies now requires."""
+    """Every collaborator WorkflowDependencies requires beyond the core three."""
+    from backend.agents.builder import BuilderAgent as _BA
+    from backend.tools.build_runner import BuildRunner as _BR
     return dict(reference_analyzer=_RAA(_RefStub()),
                 frontend_architect=_FAA(_RefStub()),
+                build_builder=lambda ws: _BA(_RefStub(), ws),
+                build_runner=_BR(timeout_seconds=600),
                 repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
 
 
@@ -91,10 +106,10 @@ print("=== 1. Topology now includes the design stage ===")
 g, _, _ = fresh()
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   expected 8:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
+print("   expected 9:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
                                           NODE_DESIGN_GATE, "requirement_analysis",
                                           "reference_analysis", "reference_gate",
-                                          "frontend_architecture"}))
+                                          "frontend_architecture", "build"}))
 
 print()
 print("=== 2. Plan approval now advances to design (not END) ===")
