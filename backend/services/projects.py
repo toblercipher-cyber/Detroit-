@@ -37,6 +37,7 @@ from __future__ import annotations
 import hashlib
 import logging
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from langgraph.types import Command
@@ -544,6 +545,18 @@ class ProjectService:
     def preview_available(self, state: ProjectState) -> bool:
         """True when a successful build has produced a preview."""
         return state.preview_status.preview_url is not None
+
+    def workspace_dir(self, project_id: str) -> Path:
+        """Where this project's built output lives.
+
+        Exposed so the preview route can find ``dist/`` without reaching into
+        ``self._repository``. The id is validated by the repository, so an
+        unknown or malformed one raises rather than resolving to a path.
+
+        Existence is not checked here: a project can legitimately have no
+        workspace yet, and the caller decides what that means.
+        """
+        return self._repository.workspace_dir(project_id)
 
     # --- Internals -------------------------------------------------------
 

@@ -48,11 +48,13 @@ from fastapi.responses import Response
 from backend.memory.artifacts import InvalidProjectIdError, ProjectNotFoundError
 from backend.schemas.api import (
     CreateProjectRequest,
+    ErrorCode,
     HitlDecisionAccepted,
     HitlDecisionRequest,
     HitlHistoryResponse,
     ProjectCreatedResponse,
     ProjectStateResponse,
+    PreviewResponse,
     ProjectSummary,
     ProjectSummaryList,
     ReferenceImageResponse,
@@ -182,6 +184,43 @@ async def get_project_status(
         preview_available=service.preview_available(state),
         last_error=state.last_error,
         updated_at=state.updated_at,
+    )
+
+
+@router.get("/{project_id}/preview", response_model=PreviewResponse)
+async def get_preview(
+    project_id: str,
+    service: ProjectService = Depends(get_project_service),
+) -> PreviewResponse:
+    """Where this project's built output can be viewed, and how current it is.
+
+    This is the authoritative answer the Chatbot page asks for before rendering
+    the sandboxed iframe (docs/architecture.md 5.5). The bytes themselves are
+    served by the separate ``/preview`` router; this endpoint only reports the
+    URL and its freshness.
+
+    409 rather than 404 when nothing has been built: the project exists, and
+    "not yet" is a different situation from "no such project" — the client
+    should keep polling, not give up (docs/api.md 2.5).
+    """
+    state = _load(service, project_id)
+    preview = state.preview_status
+
+    if not service.preview_available(state) or preview.built_at is None:
+        # Status alone cannot distinguish this from the other 409s, so the code
+        # travels on the exception. main.py's _code_for reads it in preference
+        # to the status map, which is what keeps docs/api.md 6 accurate here.
+        error = HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="No successful build is available to preview yet.",
+        )
+        error.code = ErrorCode.PREVIEW_NOT_AVAILABLE
+        raise error
+
+    return PreviewResponse(
+        preview_url=preview.preview_url,
+        built_at=preview.built_at,
+        status=preview.status,
     )
 
 

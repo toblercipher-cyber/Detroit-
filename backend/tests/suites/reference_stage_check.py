@@ -107,7 +107,7 @@ print("=== 1. Topology includes the reference stage and its gate ===")
 svc = build()
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   9 nodes        :", ok(len(nodes) == 9))  # + build
+print("   10 nodes       :", ok(len(nodes) == 10))  # + preview
 print("   reference node :", ok(NODE_REFERENCE_ANALYSIS in nodes))
 print("   reference gate :", ok(NODE_REFERENCE_GATE in nodes))
 
@@ -315,10 +315,10 @@ asyncio.run(svcA.submit_hitl_decision(pidA, HitlDecisionRequest(
 a = svcA.get(pidA)
 print("   [skip path] architecture ran :", ok(a.frontend_architecture is not None))
 print("   [skip path] reference skipped:", ok(a.reference_analysis is None))
-# Architecture has no gate, so the run continues straight into build and the
-# final stage recorded is build, not frontend_architecture.
-print("   [skip path] ran on into build:", a.current_stage.value,
-      ok(a.current_stage is WorkflowStage.BUILD))
+# Architecture, build and preview have no gates, so the run continues through
+# all three and the final stage recorded is preview.
+print("   [skip path] ran on to preview:", a.current_stage.value,
+      ok(a.current_stage is WorkflowStage.PREVIEW))
 
 # Path B: with a reference image -> approval of the reference gate reaches it.
 svcB = build_arch()
@@ -334,8 +334,8 @@ asyncio.run(svcB.submit_hitl_decision(pidB, HitlDecisionRequest(
     checkpoint_id=b.pending_checkpoint.checkpoint_id, action=HitlAction.APPROVE)))
 b2 = svcB.get(pidB)
 print("   [ref path] architecture ran  :", ok(b2.frontend_architecture is not None))
-print("   [ref path] ran on into build :", b2.current_stage.value,
-      ok(b2.current_stage is WorkflowStage.BUILD))
+print("   [ref path] ran on to preview :", b2.current_stage.value,
+      ok(b2.current_stage is WorkflowStage.PREVIEW))
 
 print()
 print("=== 12. NO gate after architecture (workflow.md 1 says 'no') ===")

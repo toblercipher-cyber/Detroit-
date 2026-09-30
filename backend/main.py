@@ -53,6 +53,7 @@ from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
+from backend.api import preview as preview_routes
 from backend.api import projects as projects_routes
 from backend.config.settings import Settings, get_settings
 from backend.context.builder import ContextBuilder
@@ -369,6 +370,9 @@ def create_app() -> FastAPI:
     # to a service; the remaining routers — HITL, reference images, build/preview,
     # evaluation, external actions, SSE events — are added as their services land.
     app.include_router(projects_routes.router)
+    # Static preview output. Deliberately outside /api/v1: it serves files a
+    # model caused to exist, not typed JSON (docs/architecture.md 5.4).
+    app.include_router(preview_routes.router)
 
     return app
 

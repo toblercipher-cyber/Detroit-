@@ -179,3 +179,70 @@ m = sorted(f.path for f in _workspace_manifest(w))
 print("   manifest:", m, ok(m == ["src/a.tsx", "src/nested/b.css"]))
 print("   posix separators:", ok(all("\\\\" not in p for p in m)))
 print("   empty workspace -> []:", ok(_workspace_manifest(Path(tempfile.mkdtemp())) == []))
+
+print()
+print("=== 8. Preview node: publishes the built output ===")
+from backend.graph.workflow import preview_node, NODE_PREVIEW, NODE_BUILD
+from backend.schemas.state import PreviewStatus
+
+# Reuses the workspace built in section 1, so dist/ is real.
+st_ok = repo.load(st.project_id)
+pv = preview_node(st_ok, deps_for(make_chat(GOOD_APP), repo))
+print("   stage PREVIEW    :", ok(pv["current_stage"] is WorkflowStage.PREVIEW))
+print("   run_status RUNNING:", ok(pv["run_status"] is RunStatus.RUNNING))
+ps = pv["preview_status"]
+print("   is a PreviewStatus:", ok(isinstance(ps, PreviewStatus)))
+print("   url is relative  :", ps.preview_url,
+      ok(ps.preview_url == "/preview/%s/" % st.project_id))
+print("   no host baked in :", ok("http" not in ps.preview_url
+                                  and "8000" not in ps.preview_url))
+print("   built_at set     :", ok(ps.built_at is not None))
+print("   status fresh     :", ps.status, ok(ps.status == "fresh"))
+print("   last_error cleared:", ok(pv["last_error"] is None))
+
+print()
+print("=== 9. Preview refuses when there is no build output ===")
+import shutil as _sh
+repo3 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_nopv_")))
+st3 = ready_state(repo3)
+pv2 = preview_node(st3, deps_for(make_chat(GOOD_APP), repo3))
+print("   no dist -> FAILED:", pv2["run_status"].value,
+      ok(pv2["run_status"] is RunStatus.FAILED))
+print("   no preview_status written:", ok("preview_status" not in pv2))
+print("   error recorded   :", ok(pv2.get("last_error") is not None))
+
+# dist/ present but empty: index.html is what a browser actually asks for.
+ws3 = repo3.workspace_dir(st3.project_id)
+(ws3 / "dist").mkdir(parents=True, exist_ok=True)
+pv3 = preview_node(st3, deps_for(make_chat(GOOD_APP), repo3))
+print("   dist without index.html -> FAILED:",
+      ok(pv3["run_status"] is RunStatus.FAILED))
+
+print()
+print("=== 10. The URL the node writes is the one that actually serves ===")
+from fastapi.testclient import TestClient
+from backend.main import create_app
+from backend.services.projects import ProjectService
+from backend.config.settings import get_settings
+svc = ProjectService(repository=repo, workflow=object(), settings=get_settings())
+client = TestClient(create_app(), raise_server_exceptions=False)
+client.__enter__()
+client.app.state.project_service = svc
+r = client.get(ps.preview_url)
+print("   GET", ps.preview_url, "->", r.status_code, ok(r.status_code == 200))
+print("   serves the built page:", ok("<!doctype html" in r.text.lower()))
+print("   security headers present:",
+      ok(r.headers.get("x-content-type-options") == "nosniff"))
+
+print()
+print("=== 11. Graph runs build -> preview -> END ===")
+from backend.graph.workflow import build_workflow
+g = build_workflow(deps_for(make_chat(GOOD_APP), repo))
+nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
+print("   nodes:", nodes)
+print("   10 nodes      :", ok(len(nodes) == 10))
+print("   preview present:", ok(NODE_PREVIEW in nodes))
+edges = {(e.source, e.target) for e in g.get_graph().edges}
+print("   build -> preview:", ok((NODE_BUILD, NODE_PREVIEW) in edges))
+print("   build no longer -> END:", ok((NODE_BUILD, "__end__") not in edges))
+print("   preview -> END :", ok((NODE_PREVIEW, "__end__") in edges))

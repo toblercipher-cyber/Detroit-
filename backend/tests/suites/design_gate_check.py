@@ -106,10 +106,11 @@ print("=== 1. Topology now includes the design stage ===")
 g, _, _ = fresh()
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   expected 9:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
-                                          NODE_DESIGN_GATE, "requirement_analysis",
-                                          "reference_analysis", "reference_gate",
-                                          "frontend_architecture", "build"}))
+print("   expected 10:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
+                                           NODE_DESIGN_GATE, "requirement_analysis",
+                                           "reference_analysis", "reference_gate",
+                                           "frontend_architecture", "build",
+                                           "preview"}))
 
 print()
 print("=== 2. Plan approval now advances to design (not END) ===")

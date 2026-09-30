@@ -77,6 +77,7 @@ from backend.schemas.state import (
     HitlCheckpoint,
     FileRef,
     HitlRecord,
+    PreviewStatus,
     ProjectState,
 )
 
@@ -96,6 +97,7 @@ NODE_REFERENCE_ANALYSIS = WorkflowStage.REFERENCE_ANALYSIS.value
 NODE_REFERENCE_GATE = "reference_gate"
 NODE_FRONTEND_ARCHITECTURE = WorkflowStage.FRONTEND_ARCHITECTURE.value
 NODE_BUILD = WorkflowStage.BUILD.value
+NODE_PREVIEW = WorkflowStage.PREVIEW.value
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
@@ -567,6 +569,64 @@ async def build_node(state: ProjectState, deps: WorkflowDependencies) -> dict[st
     }
 
 
+def preview_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, Any]:
+    """Publish the built output and record where it can be seen.
+
+    Owns: ``preview_status``. No agent and no gate (``docs/workflow.md`` 1) —
+    there is no judgement here, only the fact of what was built. It is
+    synchronous because nothing in it awaits anything.
+
+    THE URL IS RELATIVE, DELIBERATELY
+        ``/preview/{project_id}/`` rather than an absolute URL. The backend does
+        not know the origin it is reached on — behind a proxy, a tunnel, or a
+        different port, ``api_host``/``api_port`` describe where it *listens*,
+        not where a browser finds it. Baking those into stored state would
+        produce a value that is wrong everywhere except one deployment, and
+        wrong in a field that is persisted. The client resolves it against the
+        origin it already used.
+
+    FRESHNESS
+        ``fresh`` here, and that is a statement about this moment: the preview
+        was just produced from the current files. It becomes ``stale`` when
+        source changes afterwards — which happens in the Targeted Fix stage, so
+        the transition belongs there, with the code that changes the files.
+        ``PreviewStatus`` carries no snapshot to compare against, so this node
+        cannot compute staleness and does not pretend to.
+
+    A MISSING dist/ IS A FAILURE, NOT AN EMPTY PREVIEW
+        The Build node already treats "succeeded but produced nothing" as a
+        failure, so reaching here without output means something removed it
+        between stages. Recording a preview URL that serves 404 would send the
+        user, and the Visual & UX Critic, to look at nothing.
+    """
+    stage = WorkflowStage.PREVIEW
+    dist_dir = deps.repository.workspace_dir(state.project_id) / "dist"
+
+    if not dist_dir.is_dir() or not (dist_dir / "index.html").is_file():
+        logger.warning("preview has no build output project_id=%s", state.project_id)
+        return _failure_update(
+            stage,
+            AgentFailure(
+                AgentFailureKind.CONTRACT_VIOLATION,
+                "The build produced no output to preview.",
+            ),
+        )
+
+    now = _utcnow()
+    logger.info("preview ready project_id=%s", state.project_id)
+    return {
+        "preview_status": PreviewStatus(
+            preview_url=f"/preview/{state.project_id}/",
+            built_at=now,
+            status="fresh",
+        ),
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": now,
+    }
+
+
 def _workspace_manifest(workspace_dir: Path) -> list[FileRef]:
     """Every model-writable file actually present, with its size and checksum.
 
@@ -871,6 +931,9 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     async def _build(state: ProjectState) -> dict[str, Any]:
         return await build_node(state, deps)
 
+    def _preview(state: ProjectState) -> dict[str, Any]:
+        return preview_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
@@ -880,6 +943,7 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_REFERENCE_GATE, _reference_gate)
     graph.add_node(NODE_FRONTEND_ARCHITECTURE, _frontend_architecture)
     graph.add_node(NODE_BUILD, _build)
+    graph.add_node(NODE_PREVIEW, _preview)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
@@ -921,11 +985,12 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
         },
     )
 
-    # Neither architecture nor build has a gate (docs/workflow.md 1), so they run
-    # straight through. Build terminates for now: `preview` is next and is not
-    # stubbed, so the graph never claims a stage it cannot run.
+    # Architecture, build and preview have no gates (docs/workflow.md 1), so they
+    # run straight through. Preview terminates for now: `evaluation` is next and
+    # is BLOCKED on Impeccable (CLAUDE.md 15), so the graph must not claim it.
     graph.add_edge(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
-    graph.add_edge(NODE_BUILD, END)
+    graph.add_edge(NODE_BUILD, NODE_PREVIEW)
+    graph.add_edge(NODE_PREVIEW, END)
 
     if checkpointer is None:
         logger.warning(
