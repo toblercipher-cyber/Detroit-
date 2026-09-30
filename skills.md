@@ -612,8 +612,11 @@ substitute. If Impeccable is unavailable, **STOP and report the quality gate as
 BLOCKED** — never continue as if the check passed, and never substitute an
 agent-only review for it.
 
-**Availability:** Impeccable is not installed in this repository, so the evaluation
-stage is currently blocked. See `docs/design.md` §5.
+**Availability:** Impeccable is **installed** — a Claude Code skill (4.3.1) with a
+CLI (`--version` 4.0.0); `impeccable detect --json <target>` is the detector.
+`.impeccable/` is optional per-project detector config, not an installation marker.
+The evaluation stage is still blocked, but on capturing a **rendered** preview for
+the reviewers, not on Impeccable. See `docs/design.md` §5.2.
 
 Use Impeccable as an automated design-quality signal.
 

@@ -133,15 +133,48 @@ there is **no fallback substitute**.
 | **Is an agent-only review an acceptable substitute?** | **No.** An agent review may add interpretation *on top of* Impeccable findings. It may never stand in for them. |
 | **May a blocked gate be reported as a pass?** | **Never.** Reporting an uncompleted check as completed is a correctness failure, not a shortcut. |
 
-### 5.2 Current availability: NOT INSTALLED
+### 5.2 Current availability: INSTALLED
 
-Impeccable is **not installed** in this repository (`.impeccable/` is absent, and no
-`DESIGN.md` artifact exists).
+Impeccable is **installed and runnable**. It is present as a Claude Code skill:
 
-**Consequence:** the evaluation stage is **blocked** until Impeccable is installed.
-This is a real, recorded blocker (`docs/README.md`, `docs/workflow.md` §6) — not a
-condition to work around. Installing Impeccable requires explicit user approval and
-must happen before the Build → Evaluation path can complete.
+| | |
+|---|---|
+| Skill | `~/.claude/skills/impeccable` — `SKILL.md` frontmatter says **4.3.1** |
+| CLI | `scripts/bin/<platform>/impeccable[.exe]`, `--version` reports **4.0.0** |
+| Launcher | `scripts/impeccable` / `.cmd`, honours `IMPECCABLE_BIN` |
+| Detector | `impeccable detect --json <target>` → JSON findings on stdout |
+
+The three version numbers on disk disagree (4.3.1 in the skill frontmatter, 4.0.0
+from the CLI, 0.1.5 in `scripts/VERSION`). **Only the running binary's `--version`
+is recorded**, because that is the thing that produced the findings.
+
+#### Correction: this section previously claimed the opposite
+
+It read *"Impeccable is not installed (`.impeccable/` is absent)"*. That was wrong,
+and the error had consequences: `backend/tools/impeccable.py` was written to that
+premise and probed for the directory, so it would have reported the mandatory gate
+**blocked forever on a machine where the tool works** — the exact failure mode §5.1
+exists to prevent, arrived at from the other direction.
+
+`.impeccable/` is **optional per-project detector configuration** — `ignoreRules`,
+`ignoreFiles`, `ignoreValues`, and the `designSystem.enabled` toggle. A project with
+no such directory uses the detector's defaults. Its absence says nothing about
+whether Impeccable is installed, and the two must not be conflated again.
+
+The entries for `.impeccable/mocks` and `.impeccable/config.local.json` in
+`.gitignore` came from the original Lovable scaffold, not from an installation.
+
+**Availability is a property of the CLI, not of this repository.** The probe
+resolves an executable and requires it to answer `--version`; a path that merely
+exists is not enough.
+
+#### What remains blocked
+
+The detector is available, but the Evaluation stage still cannot complete: three of
+the four reviewers are granted the **rendered** preview, and capturing one (DOM plus
+screenshot) needs a headless browser that has not been approved. `RenderedPreviewPayload`
+rejects a URL alone, so there is no way to hand a reviewer something to look at. That
+is a separate, still-open decision — see `docs/workflow.md` §6.
 
 ### 5.3 Blocked-gate behavior (exact)
 

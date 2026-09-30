@@ -493,9 +493,11 @@ substitute.
 Do not advance the workflow, do not substitute an agent-only review for it, and
 **never report the check as completed when it did not run.**
 
-**Current availability:** Impeccable is **not installed in this repository**
-(`.impeccable/` is absent), so the evaluation stage is currently blocked. Installing
-it requires explicit user approval. See `docs/design.md` §5.
+**Current availability:** Impeccable is **installed** — a Claude Code skill (4.3.1)
+with a CLI (`--version` 4.0.0) whose `detect --json` is the detector. `.impeccable/`
+is optional per-project detector config, NOT an installation marker; earlier docs
+conflated the two. The evaluation stage is still blocked, but on capturing a
+rendered preview for the reviewers. See `docs/design.md` §5.2.
 
 Current Impeccable documentation describes deterministic detection for AI-generated frontend anti-patterns, live/browser iteration, design-system artifacts, and hook-based feedback for supported coding harnesses. Use the installed/current project version rather than assuming a fixed rule count or command set.
 

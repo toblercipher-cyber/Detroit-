@@ -62,5 +62,5 @@ implementation plus `docs/design.md` carry the design truth.
 | Backend | fully specified, **no code written** |
 | Database | **Supabase / PostgreSQL decided**; schema undecided by design — no DB code or driver until the user defines it |
 | MCP | specified, **no server connected** |
-| Impeccable | **MANDATORY gate, not installed** → the Evaluation stage is **BLOCKED** until it is installed (`design.md` §5) |
+| Impeccable | **MANDATORY gate, INSTALLED** (skill 4.3.1, CLI 4.0.0). The Evaluation stage is still blocked, but on **rendered-preview capture**, not on Impeccable (`design.md` §5.2) |
 | Zapier | optional automation layer, **deferred** — not the database, not the orchestrator |

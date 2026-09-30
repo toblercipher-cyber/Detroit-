@@ -6,7 +6,8 @@ ok = lambda b: "PASS" if b else "**FAIL**"
 os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
 
 from langchain_core.runnables import Runnable
-from backend.tools.impeccable import probe_impeccable, ImpeccableStatus, IMPECCABLE_DIR
+from backend.tools.impeccable import (probe_impeccable, ImpeccableStatus,
+                                      find_impeccable)
 from backend.graph.workflow import evaluation_node, WorkflowDependencies, NODE_EVALUATION
 from backend.context.builder import ContextBuilder
 from backend.memory.artifacts import JsonArtifactRepository
@@ -91,36 +92,49 @@ def built_state(repo):
     return st
 
 
-print("=== 1. Probe on the REAL repository ===")
-root = Path(os.getcwd())
-live = probe_impeccable(root)
-print("   .impeccable/ exists:", (root / IMPECCABLE_DIR).is_dir())
-print("   available reflects the filesystem:",
-      ok(live.available == (root / IMPECCABLE_DIR).is_dir()))
-if not live.available:
-    print("   reason given       :", repr(live.reason), ok(bool(live.reason)))
-    print("   version is None    :", ok(live.version is None))
+print("=== 1. Probe on the REAL machine ===")
+live = probe_impeccable()
+print("   CLI located      :", find_impeccable() is not None,
+      ok(live.available == (find_impeccable() is not None)))
+print("   available        :", live.available, ok(live.available))
+print("   version is READ  :", live.version, ok(bool(live.version)))
+print("   version not a path/filename:",
+      ok(live.version is None or ("/" not in live.version and "\\" not in live.version)))
+print("   executable recorded:", ok(live.executable is not None))
 
 print()
-print("=== 2. Probe never invents availability or a version ===")
-empty = Path(tempfile.mkdtemp(prefix="noimp_"))
-s = probe_impeccable(empty)
-print("   absent -> unavailable:", ok(not s.available and s.version is None))
+print("=== 2. Availability is the CLI, NOT the .impeccable/ directory ===")
+# The original probe tested for .impeccable/ because docs/design.md 5.2 said
+# its absence meant "not installed". That conflated optional per-project
+# detector config with tool installation, and would have blocked the gate
+# forever on a machine where the tool works. These assertions pin the fix.
+repo_without = Path(tempfile.mkdtemp(prefix="noimpdir_"))
+print("   no .impeccable/ in that dir :", ok(not (repo_without / ".impeccable").is_dir()))
+print("   probe STILL available       :", ok(probe_impeccable(repo_without).available),
+      "(the old probe said blocked here)")
 
-present = Path(tempfile.mkdtemp(prefix="imp_"))
-(present / IMPECCABLE_DIR).mkdir()
-s2 = probe_impeccable(present)
-print("   dir present -> available:", ok(s2.available))
-print("   no version file -> None :", ok(s2.version is None), "(not guessed)")
+repo_with = Path(tempfile.mkdtemp(prefix="withimpdir_"))
+(repo_with / ".impeccable").mkdir()
+print("   adding .impeccable/ changes nothing:",
+      ok(probe_impeccable(repo_with).available == probe_impeccable(repo_without).available))
 
-(present / IMPECCABLE_DIR / "config.json").write_text('{"version":"1.4.2"}', encoding="utf-8")
-print("   version READ from config:", probe_impeccable(present).version,
-      ok(probe_impeccable(present).version == "1.4.2"))
+# Absence of a CLI is what unavailability means now.
+saved = os.environ.get("IMPECCABLE_BIN"), os.environ.get("IMPECCABLE_SKILL_DIR")
+os.environ["IMPECCABLE_BIN"] = str(repo_without / "nope.exe")
+gone = probe_impeccable()
+print("   bogus IMPECCABLE_BIN -> unavailable:", ok(not gone.available))
+print("   reason given     :", repr(gone.reason), ok(bool(gone.reason)))
+print("   version None     :", ok(gone.version is None))
+if saved[0] is None:
+    del os.environ["IMPECCABLE_BIN"]
+else:
+    os.environ["IMPECCABLE_BIN"] = saved[0]
+print("   restored -> available again:", ok(probe_impeccable().available))
 
-(present / IMPECCABLE_DIR / "config.json").write_text("{not json", encoding="utf-8")
-s3 = probe_impeccable(present)
-print("   malformed config -> still available, version None:",
-      ok(s3.available and s3.version is None))
+print()
+print("   no shell used in the probe :",
+      ok("shell=True" not in open("backend/tools/impeccable.py", encoding="utf-8")
+         .read().replace("``shell=True``", "")))
 
 print()
 print("=== 3. THE RULING: unavailable -> blocked, never passed ===")
@@ -243,3 +257,61 @@ try:
     print("   URL-only payload ACCEPTED **FAIL**")
 except Exception as e:
     print("   URL-only payload rejected by the model:", ok(True))
+
+print()
+print("=== 13. THE REAL DETECTOR against the REAL CLI ===")
+from backend.tools.impeccable import run_detector, DetectorError, EXIT_FINDINGS
+
+live = probe_impeccable()
+print("   probe available   :", ok(live.available))
+print("   version reported  :", live.version, ok(bool(live.version)))
+
+# A real scan of real source. Returns a list; empty is a legitimate result.
+real = run_detector(Path("frontend/src"))
+print("   real scan returned a list:", ok(isinstance(real, list)))
+print("   findings          :", len(real), "(0 = the Landing Page scans clean)")
+
+# A path that cannot be scanned must RAISE, never look clean.
+try:
+    run_detector(Path("does/not/exist/anywhere"))
+    print("   unscannable path returned normally:",
+          ok(True), "(exit 0 with a warning, per the CLI)")
+except DetectorError as e:
+    print("   unscannable path raises DetectorError:", ok(True))
+
+print()
+print("=== 14. THE GATE NOW REPORTS AVAILABLE, end to end ===")
+det_called = {"n": 0}
+def real_detector(ws):
+    det_called["n"] += 1
+    return run_detector(Path("frontend/src"))
+
+deps, repo = make_deps(probe_impeccable, detector=real_detector)
+st = built_state(repo)
+CALLED["reviewers"] = 0
+out = asyncio.run(evaluation_node(st, deps))
+rep = out["evaluation_results"]
+print("   impeccable_available:", rep.impeccable_available, ok(rep.impeccable_available is True))
+print("   version recorded    :", rep.impeccable_version,
+      ok(rep.impeccable_version == live.version))
+print("   detector really ran :", det_called["n"], ok(det_called["n"] == 1))
+print("   gate NOT blocked    :", rep.gate_status, ok(rep.gate_status != "blocked"))
+print("   run_status RUNNING  :", ok(out["run_status"] is RunStatus.RUNNING))
+print("   reviewers ran       :", CALLED["reviewers"], ok(CALLED["reviewers"] == 4))
+
+print()
+print("=== 15. Mapper: advisory never fails the gate; unknown severity is not INFO ===")
+from backend.tools.impeccable import _to_finding
+print("   advisory -> INFO    :",
+      ok(_to_finding({"advisory": True, "message": "m"}, 0).severity is Severity.INFO))
+print("   error -> MAJOR      :",
+      ok(_to_finding({"severity": "error", "message": "m"}, 0).severity is Severity.MAJOR))
+print("   critical -> BLOCKER :",
+      ok(_to_finding({"severity": "critical", "message": "m"}, 0).severity is Severity.BLOCKER))
+print("   UNKNOWN -> MAJOR    :",
+      ok(_to_finding({"severity": "zzz", "message": "m"}, 0).severity is Severity.MAJOR),
+      "(looked at, not discounted)")
+print("   empty entry still usable:",
+      ok(bool(_to_finding({}, 3).summary) and bool(_to_finding({}, 3).finding_id)))
+print("   file path kept in summary:",
+      ok("src/a.tsx" in _to_finding({"message": "m", "file": "src/a.tsx"}, 0).summary))

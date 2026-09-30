@@ -36,7 +36,6 @@ from __future__ import annotations
 
 import logging
 import uuid
-from pathlib import Path
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 
@@ -65,7 +64,7 @@ from backend.context.builder import ContextBuilder
 from backend.graph.workflow import WorkflowDependencies, build_workflow
 from backend.memory.artifacts import JsonArtifactRepository
 from backend.tools.build_runner import BuildRunner
-from backend.tools.impeccable import probe_impeccable
+from backend.tools.impeccable import probe_impeccable, run_detector
 from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, ErrorResponse, HealthResponse
 from backend.schemas.enums import AgentRole
@@ -75,10 +74,6 @@ from backend.services.projects import ProjectService
 # Version of the builder backend itself, reported by /health. Unrelated to the
 # version of any project it generates.
 APP_VERSION = "0.1.0"
-
-# The repository root, two levels up from backend/main.py. Used to probe for
-# Impeccable, which installs at the root (docs/design.md 5.2).
-REPO_ROOT = Path(__file__).resolve().parents[1]
 
 API_PREFIX = "/api/v1"
 
@@ -229,14 +224,13 @@ def build_project_service(settings: Settings) -> ProjectService:
             code_reviewer=CodeReviewerAgent(
                 model_for(AgentRole.CODE_REVIEWER)
             ),
-            # Probed on every evaluation, from the real filesystem. Bound to
-            # the repository root here so no lower layer has to guess where
-            # that is (CLAUDE.md 15).
-            impeccable_probe=lambda: probe_impeccable(REPO_ROOT),
-            # Deliberately absent: Impeccable is not installed, so there is no
-            # real interface to call. The gate blocks rather than passing
-            # (docs/design.md 5.2).
-            impeccable_detector=None,
+            # Probed on every evaluation. Availability is a property of the
+            # installed CLI, not of this repository (docs/design.md 5.2).
+            impeccable_probe=probe_impeccable,
+            # The real detector: `impeccable detect --json <dist>`. It raises
+            # rather than returning [] on a failed scan, and the node turns that
+            # into a BLOCKED gate (docs/design.md 5.3).
+            impeccable_detector=run_detector,
             # Also absent: capturing a rendered preview needs a headless
             # browser, which is a dependency nobody has approved. The gate
             # blocks rather than reviewing an unrendered page.

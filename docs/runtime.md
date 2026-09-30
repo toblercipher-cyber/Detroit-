@@ -53,7 +53,7 @@ pinned in the manifest when it is created.
 |---|---|---|
 | Supabase client / Postgres driver / migration tool | **deferred** | the user defining the database schema (`docs/architecture.md` §3.8) |
 | Checkpointer package | **undecided** | choosing the interim checkpointer (`docs/state.md` §5.1) |
-| Impeccable | **required but not installed** | user approval; the Evaluation stage is blocked until then (`docs/design.md` §5) |
+| Impeccable | **required and installed** (skill 4.3.1, CLI 4.0.0) | — nothing to add; it is not a Python dependency (`docs/design.md` §5.2) |
 | Zapier client / webhook tooling | **deferred** | the user enabling the automation layer (`docs/architecture.md` §3.9) |
 | Anything else | not in the documented architecture | an explicit decision |
 

@@ -78,7 +78,9 @@ enter Evaluation
 An agent-only review may add interpretation on top of Impeccable findings. It may
 never stand in for them, and a blocked gate is never reported as a pass.
 
-**Current status: Impeccable is not installed, so this stage is blocked.**
+**Current status: Impeccable IS installed** (skill 4.3.1, CLI 4.0.0). The stage is
+still blocked, but on capturing a **rendered** preview for the reviewers, not on
+the detector (`docs/design.md` §5.2).
 
 ## 2. Adaptive HITL
 
