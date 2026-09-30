@@ -70,6 +70,15 @@ langchain-anthropic==1.7.2
 # than resolved implicitly.
 httpx==0.28.1
 
+# --- Testing ----------------------------------------------------------------
+# Runs the verification suites in backend/tests. Not needed to serve the API, but
+# pinned with everything else so a checkout tests identically.
+#
+# pytest-asyncio is deliberately NOT here: the suites drive async code with
+# asyncio.run() inside standalone scripts, so no event-loop plugin is involved.
+# Add it only if a suite is ever written as an async test function.
+pytest==9.1.1
+
 
 # ============================================================================
 # DEFERRED — do NOT add without an explicit decision (docs/runtime.md 2.1)
