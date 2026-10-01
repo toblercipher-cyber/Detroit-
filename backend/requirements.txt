@@ -70,6 +70,20 @@ langchain-anthropic==1.7.2
 # than resolved implicitly.
 httpx==0.28.1
 
+# --- Rendered-preview capture -----------------------------------------------
+# Renders a generated project in headless Chromium so the reviewers granted the
+# RENDERED preview have a DOM and screenshots to look at. Without it the
+# mandatory quality gate blocks: RenderedPreviewPayload refuses a URL alone, and
+# the shipped index.html is an empty <div id="root"> before React runs.
+#
+# REQUIRES A SEPARATE, NON-pip STEP. The browser is not a Python package:
+#
+#     python -m playwright install chromium
+#
+# A fresh checkout that skips it gets a clear launch failure, which the capture
+# converts into a BLOCKED gate rather than a silent pass.
+playwright==1.63.0
+
 # --- Testing ----------------------------------------------------------------
 # Runs the verification suites in backend/tests. Not needed to serve the API, but
 # pinned with everything else so a checkout tests identically.

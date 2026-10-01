@@ -65,6 +65,7 @@ from backend.graph.workflow import WorkflowDependencies, build_workflow
 from backend.memory.artifacts import JsonArtifactRepository
 from backend.tools.build_runner import BuildRunner
 from backend.tools.impeccable import probe_impeccable, run_detector
+from backend.tools.preview_capture import capture_preview
 from backend.tools.workspace import WorkspaceFiles
 from backend.schemas.api import ErrorCode, ErrorResponse, HealthResponse
 from backend.schemas.enums import AgentRole
@@ -231,10 +232,12 @@ def build_project_service(settings: Settings) -> ProjectService:
             # rather than returning [] on a failed scan, and the node turns that
             # into a BLOCKED gate (docs/design.md 5.3).
             impeccable_detector=run_detector,
-            # Also absent: capturing a rendered preview needs a headless
-            # browser, which is a dependency nobody has approved. The gate
-            # blocks rather than reviewing an unrendered page.
-            preview_capture=None,
+            # Renders the build in headless Chromium and captures the DOM and
+            # screenshots the reviewers are granted. Raises rather than
+            # returning a partial payload, and the node turns that into a
+            # BLOCKED gate — a half-captured preview reviewed as if it were
+            # whole is worse than none (docs/agents.md 4.6-4.9).
+            preview_capture=capture_preview,
             # The same repository the service uses. Reference Analysis needs the
             # image bytes, which state does not carry; sharing one instance keeps
             # a single view of what is on disk.
