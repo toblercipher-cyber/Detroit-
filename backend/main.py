@@ -52,6 +52,7 @@ from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.builder import BuilderAgent
 from backend.agents.code_reviewer import CodeReviewerAgent
 from backend.agents.design_director import DesignDirectorAgent
+from backend.agents.fixer import FixerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
@@ -210,6 +211,10 @@ def build_project_service(settings: Settings) -> ProjectService:
             build_builder=lambda workspace: BuilderAgent(
                 model_for(AgentRole.BUILDER), workspace
             ),
+            # Per-workspace, for the same reason as the Builder.
+            build_fixer=lambda workspace: FixerAgent(
+                model_for(AgentRole.FIXER), workspace
+            ),
             build_runner=BuildRunner(
                 timeout_seconds=settings.preview_build_timeout_seconds
             ),
@@ -228,6 +233,9 @@ def build_project_service(settings: Settings) -> ProjectService:
             # Probed on every evaluation. Availability is a property of the
             # installed CLI, not of this repository (docs/design.md 5.2).
             impeccable_probe=probe_impeccable,
+            # Configuration owns the correction budget, not the graph
+            # (docs/workflow.md 4).
+            max_auto_iterations=settings.max_auto_iterations,
             # The real detector: `impeccable detect --json <dist>`. It raises
             # rather than returning [] on a failed scan, and the node turns that
             # into a BLOCKED gate (docs/design.md 5.3).

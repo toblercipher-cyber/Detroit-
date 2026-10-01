@@ -59,6 +59,7 @@ class _RefStub(_R):
 def _ref_deps():
     """Every collaborator WorkflowDependencies requires beyond the core three."""
     from backend.agents.builder import BuilderAgent as _BA
+    from backend.agents.fixer import FixerAgent as _FX
     from backend.agents.visual_ux_critic import VisualUxCriticAgent as _VC
     from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent as _AS
     from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent as _AR
@@ -73,6 +74,8 @@ def _ref_deps():
                 anti_slop_reviewer=_AS(_RefStub()),
                 accessibility_reviewer=_AR(_RefStub()),
                 code_reviewer=_CR(_RefStub()),
+                build_fixer=lambda ws: _FX(_RefStub(), ws),
+                max_auto_iterations=3,
                 # Blocked, which is the real state of this repository.
                 impeccable_probe=lambda: _IS(False, reason="not installed"),
                 repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))

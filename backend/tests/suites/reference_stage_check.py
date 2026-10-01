@@ -27,6 +27,7 @@ from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.builder import BuilderAgent
+from backend.agents.fixer import FixerAgent
 from backend.tools.build_runner import BuildRunner
 from backend.tools.impeccable import ImpeccableStatus
 from backend.agents.visual_ux_critic import VisualUxCriticAgent
@@ -93,6 +94,8 @@ def build(tmp=None):
         reference_analyzer=ReferenceAnalyzerAgent(FakeChat()),
         frontend_architect=FrontendArchitectAgent(FakeChat()),
         build_builder=lambda ws: BuilderAgent(FakeChat(), ws),
+        build_fixer=lambda ws: FixerAgent(FakeChat(), ws),
+        max_auto_iterations=3,
         build_runner=BuildRunner(timeout_seconds=600),
         visual_ux_critic=VisualUxCriticAgent(FakeChat()),
         anti_slop_reviewer=AntiSlopReviewerAgent(FakeChat()),
@@ -117,7 +120,7 @@ print("=== 1. Topology includes the reference stage and its gate ===")
 svc = build()
 nodes = sorted(n for n in svc._workflow.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   11 nodes       :", ok(len(nodes) == 11))  # + evaluation
+print("   15 nodes       :", ok(len(nodes) == 15))  # full v1 pipeline
 print("   reference node :", ok(NODE_REFERENCE_ANALYSIS in nodes))
 print("   reference gate :", ok(NODE_REFERENCE_GATE in nodes))
 
@@ -311,6 +314,8 @@ def build_arch():
         reference_analyzer=ReferenceAnalyzerAgent(ArchChat()),
         frontend_architect=FrontendArchitectAgent(ArchChat()),
         build_builder=lambda ws: BuilderAgent(ArchChat(), ws),
+        build_fixer=lambda ws: FixerAgent(ArchChat(), ws),
+        max_auto_iterations=3,
         build_runner=BuildRunner(timeout_seconds=600),
         visual_ux_critic=VisualUxCriticAgent(FakeChat()),
         anti_slop_reviewer=AntiSlopReviewerAgent(FakeChat()),

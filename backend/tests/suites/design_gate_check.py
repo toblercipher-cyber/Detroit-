@@ -53,6 +53,7 @@ class _RefStub(_R):
 def _ref_deps():
     """Every collaborator WorkflowDependencies requires beyond the core three."""
     from backend.agents.builder import BuilderAgent as _BA
+    from backend.agents.fixer import FixerAgent as _FX
     from backend.agents.visual_ux_critic import VisualUxCriticAgent as _VC
     from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent as _AS
     from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent as _AR
@@ -67,6 +68,8 @@ def _ref_deps():
                 anti_slop_reviewer=_AS(_RefStub()),
                 accessibility_reviewer=_AR(_RefStub()),
                 code_reviewer=_CR(_RefStub()),
+                build_fixer=lambda ws: _FX(_RefStub(), ws),
+                max_auto_iterations=3,
                 # Blocked, which is the real state of this repository.
                 impeccable_probe=lambda: _IS(False, reason="not installed"),
                 repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
@@ -117,11 +120,14 @@ print("=== 1. Topology now includes the design stage ===")
 g, _, _ = fresh()
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   expected 11:", ok(set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
+print("   expected 15:", ok(len(nodes) == 15 and set(nodes) == {NODE_PLANNING, NODE_PLAN_GATE, NODE_DESIGN,
                                            NODE_DESIGN_GATE, "requirement_analysis",
                                            "reference_analysis", "reference_gate",
                                            "frontend_architecture", "build",
-                                           "preview", "evaluation"}))
+                                           "preview", "evaluation",
+                                           "targeted_fix", "re_evaluation",
+                                           "final_validation",
+                                           "final_validation_gate"}))
 
 print()
 print("=== 2. Plan approval now advances to design (not END) ===")

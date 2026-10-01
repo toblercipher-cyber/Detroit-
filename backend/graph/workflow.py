@@ -59,6 +59,7 @@ from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
 from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.builder import BuilderAgent
 from backend.agents.code_reviewer import CodeReviewerAgent
+from backend.agents.fixer import FixerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
@@ -115,6 +116,10 @@ NODE_FRONTEND_ARCHITECTURE = WorkflowStage.FRONTEND_ARCHITECTURE.value
 NODE_BUILD = WorkflowStage.BUILD.value
 NODE_PREVIEW = WorkflowStage.PREVIEW.value
 NODE_EVALUATION = WorkflowStage.EVALUATION.value
+NODE_TARGETED_FIX = WorkflowStage.TARGETED_FIX.value
+NODE_RE_EVALUATION = WorkflowStage.RE_EVALUATION.value
+NODE_FINAL_VALIDATION = WorkflowStage.FINAL_VALIDATION.value
+NODE_FINAL_GATE = "final_validation_gate"
 
 # Where a stage parks a custom instruction until it re-runs. One key per stage,
 # so a refinement meant for the plan can never be picked up by the design pass.
@@ -122,6 +127,9 @@ _INSTRUCTION_KEYS: dict[WorkflowStage, str] = {
     WorkflowStage.PLANNING: "planning_instruction",
     WorkflowStage.DESIGN: "design_instruction",
     WorkflowStage.REFERENCE_ANALYSIS: "reference_instruction",
+    # The final gate reviews finished output; a revision there means another
+    # correction pass, which is driven by findings rather than a stored note.
+    WorkflowStage.FINAL_VALIDATION: "final_instruction",
 }
 
 # An agent failure is recorded in state with a stable, safe code. Upstream problems
@@ -154,6 +162,8 @@ class WorkflowDependencies:
     # A factory, not an agent: the Builder holds a handle to ONE workspace, so
     # it is built per project rather than shared (backend/agents/builder.py).
     build_builder: Callable[[WorkspaceFiles], BuilderAgent]
+    # Same reason as the Builder: the Fixer holds a handle to ONE workspace.
+    build_fixer: Callable[[WorkspaceFiles], FixerAgent]
     build_runner: BuildRunner
     visual_ux_critic: VisualUxCriticAgent
     anti_slop_reviewer: AntiSlopReviewerAgent
@@ -162,6 +172,9 @@ class WorkflowDependencies:
     # Answers 'is Impeccable installed'. Injected so a test can drive both
     # outcomes without touching the filesystem (CLAUDE.md 15).
     impeccable_probe: Callable[[], ImpeccableStatus]
+    # The automatic-correction budget (docs/workflow.md 4). Injected rather
+    # than hard-coded so configuration owns the limit, not the graph.
+    max_auto_iterations: int
     # Reference Analysis needs the image BYTES, which state does not carry;
     # this is the only reason the graph touches persistence at all.
     repository: StateRepository
@@ -663,6 +676,29 @@ def preview_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, A
 async def evaluation_node(
     state: ProjectState, deps: WorkflowDependencies
 ) -> dict[str, Any]:
+    """The first pass of the mandatory quality gate."""
+    return await _evaluate(state, deps, WorkflowStage.EVALUATION)
+
+
+async def re_evaluation_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """The same gate, run again after a Targeted Fix.
+
+    ``docs/workflow.md`` 1 lists Re-evaluation as "same as Evaluation" with
+    updated findings, so it delegates rather than duplicating: two copies of a
+    mandatory gate is two places for it to drift, and the one that drifts is
+    the one nobody is reading.
+
+    Only the recorded stage differs, which is what lets the user and the audit
+    trail tell a first look from a re-check.
+    """
+    return await _evaluate(state, deps, WorkflowStage.RE_EVALUATION)
+
+
+async def _evaluate(
+    state: ProjectState, deps: WorkflowDependencies, stage: WorkflowStage
+) -> dict[str, Any]:
     """Run the mandatory quality gate, or report honestly that it cannot run.
 
     Owns: ``evaluation_results``.
@@ -694,7 +730,6 @@ async def evaluation_node(
         because a reviewer crashed would be worse than one that failed. A failed
         reviewer therefore blocks the gate rather than being dropped.
     """
-    stage = WorkflowStage.EVALUATION
     status = deps.impeccable_probe()
 
     if not status.available:
@@ -703,7 +738,7 @@ async def evaluation_node(
             state.project_id,
             status.reason,
         )
-        return _blocked_gate(state, status.version, status.reason)
+        return _blocked_gate(state, status.version, status.reason, stage)
 
     if deps.impeccable_detector is None:
         # Installed but not wired. Reported as blocked for the same reason:
@@ -711,7 +746,7 @@ async def evaluation_node(
         reason = "Impeccable is installed but its detector is not wired."
         logger.warning("quality gate BLOCKED project_id=%s reason=%s",
                        state.project_id, reason)
-        return _blocked_gate(state, status.version, reason)
+        return _blocked_gate(state, status.version, reason, stage)
 
     if deps.preview_capture is None:
         # Three reviewers are granted the RENDERED preview, and
@@ -723,7 +758,7 @@ async def evaluation_node(
         reason = "The rendered preview cannot be captured, so it cannot be reviewed."
         logger.warning("quality gate BLOCKED project_id=%s reason=%s",
                        state.project_id, reason)
-        return _blocked_gate(state, status.version, reason)
+        return _blocked_gate(state, status.version, reason, stage)
 
     workspace = deps.repository.workspace_dir(state.project_id)
     try:
@@ -731,7 +766,8 @@ async def evaluation_node(
     except Exception:
         logger.exception("impeccable detector failed project_id=%s", state.project_id)
         return _blocked_gate(
-            state, status.version, "The Impeccable detector could not be run."
+            state, status.version,
+            "The Impeccable detector could not be run.", stage,
         )
 
     reviews, review_failed = await _run_reviewers(state, deps, detector_findings)
@@ -739,7 +775,8 @@ async def evaluation_node(
 
     if review_failed:
         return _blocked_gate(
-            state, status.version, "A reviewer failed, so the gate is inconclusive."
+            state, status.version,
+            "A reviewer failed, so the gate is inconclusive.", stage,
         )
 
     blocking = [f for f in findings if f.severity is Severity.BLOCKER]
@@ -766,8 +803,181 @@ async def evaluation_node(
     }
 
 
+async def targeted_fix_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """Correct what the gate found, touching only what the findings name.
+
+    Owns: ``iteration_count``. It is the only node permitted to increment it
+    (``docs/state.md`` 3), which is what makes the limit in
+    ``docs/workflow.md`` 4 enforceable from one place.
+
+    THE COUNTER GOES UP EVEN WHEN THE FIX FAILS
+        An attempt that achieved nothing still consumed an attempt. Not
+        counting it would let a repeatedly-failing Fixer loop forever while the
+        budget never moved — the exact runaway the limit exists to stop.
+
+    SCOPE
+        The Fixer is granted the findings and the changed files, and nothing
+        else (``docs/agents.md`` 4.11). It writes under ``src/`` through the
+        same workspace tool the Builder uses, so "fix the hero" cannot become
+        "rewrite the project" (``docs/workflow.md`` 5).
+
+    WHAT IS RECORDED IS WHAT HAPPENED
+        ``FixResult`` is assembled by the agent from the writes the tool
+        actually performed, and ``generated_files`` is re-read from disk
+        afterwards. Neither is the model's account of its own work.
+    """
+    stage = WorkflowStage.TARGETED_FIX
+    findings = list(state.evaluation_results.findings) if state.evaluation_results else []
+
+    if not findings:
+        # Unreachable through the router, which only sends failures here. A fix
+        # with nothing to fix would be an invitation to invent work.
+        return _failure_update(
+            stage,
+            AgentFailure(
+                AgentFailureKind.CONTRACT_VIOLATION,
+                "Targeted Fix was reached with no findings to address.",
+            ),
+        )
+
+    workspace_dir = deps.repository.workspace_dir(state.project_id)
+    workspace = WorkspaceFiles(workspace_dir)
+    changed = [
+        ChangedFilePayload(path=ref.path, content=_read_source(workspace_dir, ref.path))
+        for ref in state.generated_files
+    ]
+
+    try:
+        context = deps.context_builder.build(
+            state,
+            AgentRole.FIXER,
+            task=(
+                "Address these findings in the smallest scope that resolves "
+                "them. Leave everything else exactly as it is."
+            ),
+            findings=findings,
+            changed_files=changed,
+        )
+    except ContextPermissionError as exc:
+        return _failure_update(
+            stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, str(exc))
+        )
+
+    # Incremented regardless of outcome, so it is set before any early return.
+    iteration = state.iteration_count + 1
+    result = await deps.build_fixer(workspace).run(context)
+    if not result.ok:
+        update = _failure_update(stage, result.failure)
+        update["iteration_count"] = iteration
+        return update
+
+    fix = result.output
+    logger.info(
+        "targeted fix complete project_id=%s iteration=%d modified=%d unresolved=%d",
+        state.project_id,
+        iteration,
+        len(fix.files_modified),
+        len(fix.unresolved),
+    )
+    return {
+        "iteration_count": iteration,
+        "generated_files": _workspace_manifest(workspace_dir),
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
+def _read_source(workspace_dir: Path, relative: str) -> str:
+    """One generated file's text, or empty when it cannot be read.
+
+    The Fixer needs the actual content, not a path: it is editing this code.
+    An unreadable file yields an empty string rather than raising, because one
+    missing file should not abandon a fix for the others — and the agent is
+    told plainly what it was given.
+    """
+    try:
+        return (workspace_dir / relative).read_text(encoding="utf-8")
+    except OSError:
+        logger.warning("could not read %s for the fixer", relative)
+        return ""
+
+
+def final_validation_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """Summarise what was produced, for the user's final review.
+
+    No agent: ``docs/workflow.md`` 1 marks this stage *(harness)*. Everything
+    here is already known — what was built, what the gate said, where to look.
+    Asking a model to restate facts the harness holds would add a place for
+    them to be restated wrongly.
+
+    This stage DOES have a gate (the final review), which is the last point
+    before any external action.
+    """
+    stage = WorkflowStage.FINAL_VALIDATION
+    report = state.evaluation_results
+
+    if report is None or report.gate_status != "passed":
+        # The router does not send unpassed work here, so reaching this means a
+        # defect. Refusing is better than presenting unreviewed output as final.
+        return _failure_update(
+            stage,
+            AgentFailure(
+                AgentFailureKind.CONTRACT_VIOLATION,
+                "Final Validation was reached without a passing quality gate.",
+            ),
+        )
+
+    logger.info(
+        "final validation ready project_id=%s files=%d iterations=%d",
+        state.project_id,
+        len(state.generated_files),
+        state.iteration_count,
+    )
+    return {
+        "current_stage": stage,
+        "run_status": RunStatus.RUNNING,
+        "last_error": None,
+        "updated_at": _utcnow(),
+    }
+
+
+def final_validation_gate_node(
+    state: ProjectState, deps: WorkflowDependencies
+) -> dict[str, Any]:
+    """The final review gate.
+
+    Built from facts the harness already holds, not from a model's description
+    of its own output: how many files, how many corrections, and what the
+    mandatory gate concluded.
+    """
+    report = state.evaluation_results
+    findings = len(report.findings) if report else 0
+    summary = (
+        f"{len(state.generated_files)} file(s) generated, "
+        f"{state.iteration_count} automatic correction(s), "
+        f"quality gate {report.gate_status if report else 'unknown'} "
+        f"with {findings} finding(s)."
+    )
+    return _gate_node(
+        state,
+        stage=WorkflowStage.FINAL_VALIDATION,
+        title="Final review",
+        result_ref="generated_files",
+        summary=summary,
+    )
+
+
 def _blocked_gate(
-    state: ProjectState, version: str | None, reason: str
+    state: ProjectState,
+    version: str | None,
+    reason: str,
+    stage: WorkflowStage = WorkflowStage.EVALUATION,
 ) -> dict[str, Any]:
     """The blocked outcome, recorded so it cannot be mistaken for a result.
 
@@ -785,7 +995,7 @@ def _blocked_gate(
             gate_status="blocked",
             findings=[],
         ),
-        "current_stage": WorkflowStage.EVALUATION,
+        "current_stage": stage,
         "run_status": RunStatus.BLOCKED,
         "last_error": ErrorBody(
             code=ErrorCode.QUALITY_GATE_BLOCKED.value, message=reason
@@ -1083,6 +1293,43 @@ def reference_gate_node(state: ProjectState, deps: WorkflowDependencies) -> dict
     )
 
 
+def route_after_preview(state: ProjectState) -> str:
+    """First pass goes to Evaluation; a pass after a fix goes to Re-evaluation.
+
+    The two run identical work (:func:`_evaluate`); only the recorded stage
+    differs. Branching here rather than inside the node keeps "which pass is
+    this" a property of the path taken, not of a flag the node has to interpret.
+    """
+    return "re_evaluate" if state.iteration_count > 0 else "evaluate"
+
+
+def route_after_evaluation(state: ProjectState, max_iterations: int) -> str:
+    """Decide what a quality verdict means for the run.
+
+    Four outcomes, and the two that stop are as important as the two that move:
+
+    - **passed** → Final Validation.
+    - **blocked** → stop. ``CLAUDE.md`` 15: never continue as though it passed.
+    - **failed**, under the limit → Targeted Fix.
+    - **failed**, at the limit → stop and surface the unresolved findings
+      (``docs/workflow.md`` 4). Not another variation: "after repeated
+      rejection of the same thing, surface the conflict".
+    """
+    report = state.evaluation_results
+    if report is None or report.gate_status == "blocked":
+        return "stop"
+    if report.gate_status == "passed":
+        return "validate"
+    if state.iteration_count >= max_iterations:
+        logger.warning(
+            "correction limit reached project_id=%s iterations=%d; surfacing findings",
+            state.project_id,
+            state.iteration_count,
+        )
+        return "exhausted"
+    return "fix"
+
+
 def route_after_design_gate(state: ProjectState) -> str:
     """Approval goes to Reference Analysis only when there is an image to read.
 
@@ -1165,6 +1412,18 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     async def _evaluation(state: ProjectState) -> dict[str, Any]:
         return await evaluation_node(state, deps)
 
+    async def _targeted_fix(state: ProjectState) -> dict[str, Any]:
+        return await targeted_fix_node(state, deps)
+
+    async def _re_evaluation(state: ProjectState) -> dict[str, Any]:
+        return await re_evaluation_node(state, deps)
+
+    def _final_validation(state: ProjectState) -> dict[str, Any]:
+        return final_validation_node(state, deps)
+
+    def _final_gate(state: ProjectState) -> dict[str, Any]:
+        return final_validation_gate_node(state, deps)
+
     graph.add_node(NODE_REQUIREMENT_ANALYSIS, _requirement_analysis)
     graph.add_node(NODE_PLANNING, _planning)
     graph.add_node(NODE_PLAN_GATE, _plan_gate)
@@ -1176,6 +1435,10 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_BUILD, _build)
     graph.add_node(NODE_PREVIEW, _preview)
     graph.add_node(NODE_EVALUATION, _evaluation)
+    graph.add_node(NODE_TARGETED_FIX, _targeted_fix)
+    graph.add_node(NODE_RE_EVALUATION, _re_evaluation)
+    graph.add_node(NODE_FINAL_VALIDATION, _final_validation)
+    graph.add_node(NODE_FINAL_GATE, _final_gate)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
     graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
@@ -1222,11 +1485,45 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     # is BLOCKED on Impeccable (CLAUDE.md 15), so the graph must not claim it.
     graph.add_edge(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
     graph.add_edge(NODE_BUILD, NODE_PREVIEW)
-    graph.add_edge(NODE_PREVIEW, NODE_EVALUATION)
-    # Evaluation terminates whatever it decides. A blocked gate must STOP and be
-    # reported (CLAUDE.md 15); a passing one would advance to Targeted Fix,
-    # which is not stubbed. Either way the graph ends here for now.
-    graph.add_edge(NODE_EVALUATION, END)
+
+    # A fix changes src/, so the correction loop runs back through build and
+    # preview: re-evaluating a stale dist/ would review the previous version
+    # (docs/workflow.md 5, "modify -> validate -> re-render -> re-evaluate").
+    # Which evaluation it lands in is decided by whether a fix has happened.
+    graph.add_conditional_edges(
+        NODE_PREVIEW,
+        route_after_preview,
+        {"evaluate": NODE_EVALUATION, "re_evaluate": NODE_RE_EVALUATION},
+    )
+
+    # Both passes share one verdict router; only the destinations are written
+    # twice, because the stages they belong to differ.
+    def _verdict(state: ProjectState) -> str:
+        return route_after_evaluation(state, deps.max_auto_iterations)
+
+    # "stop" and "exhausted" both END, deliberately as separate labels: a
+    # blocked gate and an exhausted budget are different situations for the
+    # user, and collapsing them would hide which one occurred.
+    verdict_targets = {
+        "validate": NODE_FINAL_VALIDATION,
+        "fix": NODE_TARGETED_FIX,
+        "stop": END,
+        "exhausted": END,
+    }
+    graph.add_conditional_edges(NODE_EVALUATION, _verdict, verdict_targets)
+    graph.add_conditional_edges(NODE_RE_EVALUATION, _verdict, verdict_targets)
+
+    graph.add_edge(NODE_TARGETED_FIX, NODE_BUILD)
+    graph.add_edge(NODE_FINAL_VALIDATION, NODE_FINAL_GATE)
+
+    # Approval ends v1. `external_action` is next and is gated on MCP, which is
+    # not built, so the graph does not claim it. A revision at the final gate
+    # re-runs the correction loop rather than regenerating the project.
+    graph.add_conditional_edges(
+        NODE_FINAL_GATE,
+        route_after_gate,
+        {"approved": END, "revise": NODE_TARGETED_FIX, "stop": END},
+    )
 
     if checkpointer is None:
         logger.warning(

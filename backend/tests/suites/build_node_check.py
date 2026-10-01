@@ -15,6 +15,7 @@ from langchain_core.runnables import Runnable
 
 from backend.graph.workflow import build_node, WorkflowDependencies, _workspace_manifest
 from backend.agents.builder import BuilderAgent
+from backend.agents.fixer import FixerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.agents.planner import PlannerAgent
 from backend.agents.design_director import DesignDirectorAgent
@@ -86,6 +87,8 @@ def deps_for(chat, repo, timeout=600):
         reference_analyzer=ReferenceAnalyzerAgent(stub),
         frontend_architect=FrontendArchitectAgent(stub),
         build_builder=lambda ws: BuilderAgent(chat, ws),
+        build_fixer=lambda ws: FixerAgent(chat, ws),
+        max_auto_iterations=3,
         build_runner=BuildRunner(timeout_seconds=timeout),
         visual_ux_critic=VisualUxCriticAgent(stub),
         anti_slop_reviewer=AntiSlopReviewerAgent(stub),
@@ -250,7 +253,7 @@ from backend.graph.workflow import build_workflow
 g = build_workflow(deps_for(make_chat(GOOD_APP), repo))
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 print("   nodes:", nodes)
-print("   11 nodes      :", ok(len(nodes) == 11))
+print("   15 nodes      :", ok(len(nodes) == 15))
 print("   preview present:", ok(NODE_PREVIEW in nodes))
 edges = {(e.source, e.target) for e in g.get_graph().edges}
 print("   build -> preview:", ok((NODE_BUILD, NODE_PREVIEW) in edges))

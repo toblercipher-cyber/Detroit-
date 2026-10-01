@@ -199,6 +199,7 @@ from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.builder import BuilderAgent
+from backend.agents.fixer import FixerAgent
 from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
@@ -249,6 +250,8 @@ deps = WorkflowDependencies(
     design_director=DesignDirectorAgent(rs), reference_analyzer=ReferenceAnalyzerAgent(rs),
     frontend_architect=FrontendArchitectAgent(rs),
     build_builder=lambda w_: BuilderAgent(rs, w_),
+        build_fixer=lambda w_: FixerAgent(rs, w_),
+        max_auto_iterations=3,
     build_runner=BuildRunner(timeout_seconds=600),
     visual_ux_critic=VisualUxCriticAgent(rs), anti_slop_reviewer=AntiSlopReviewerAgent(rs),
     accessibility_reviewer=AccessibilityReviewerAgent(rs), code_reviewer=CodeReviewerAgent(rs),

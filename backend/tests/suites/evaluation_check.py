@@ -18,6 +18,7 @@ from backend.agents.design_director import DesignDirectorAgent
 from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.frontend_architect import FrontendArchitectAgent
 from backend.agents.builder import BuilderAgent
+from backend.agents.fixer import FixerAgent
 from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.agents.anti_slop_reviewer import AntiSlopReviewerAgent
 from backend.agents.accessibility_reviewer import AccessibilityReviewerAgent
@@ -75,6 +76,8 @@ def make_deps(probe, detector=None, severity=Severity.MINOR, boom=False,
         reference_analyzer=ReferenceAnalyzerAgent(st),
         frontend_architect=FrontendArchitectAgent(st),
         build_builder=lambda ws: BuilderAgent(st, ws),
+        build_fixer=lambda ws: FixerAgent(st, ws),
+        max_auto_iterations=3,
         build_runner=BuildRunner(timeout_seconds=60),
         visual_ux_critic=VisualUxCriticAgent(st),
         anti_slop_reviewer=AntiSlopReviewerAgent(st),
@@ -229,11 +232,15 @@ deps, repo = make_deps(lambda: ImpeccableStatus(False, reason="x"))
 g = build_workflow(deps)
 nodes = sorted(n for n in g.get_graph().nodes if not n.startswith("__"))
 edges = {(e.source, e.target) for e in g.get_graph().edges}
-print("   11 nodes            :", len(nodes), ok(len(nodes) == 11))
+print("   15 nodes            :", len(nodes), ok(len(nodes) == 15))
 print("   evaluation present  :", ok(NODE_EVALUATION in nodes))
 print("   preview -> evaluation:", ok((NODE_PREVIEW, NODE_EVALUATION) in edges))
-print("   evaluation -> END   :", ok((NODE_EVALUATION, "__end__") in edges))
-print("   targeted_fix NOT claimed:", ok("targeted_fix" not in nodes))
+print("   evaluation can END  :", ok((NODE_EVALUATION, "__end__") in edges))
+print("   evaluation -> targeted_fix:", ok((NODE_EVALUATION, "targeted_fix") in edges))
+# targeted_fix now EXISTS; what must stay unclaimed is external_action,
+# which is gated on MCP.
+print("   targeted_fix now claimed:", ok("targeted_fix" in nodes))
+print("   external_action NOT claimed:", ok("external_action" not in nodes))
 
 print()
 print("=== 11. No preview capture -> blocked, reviewers never run ===")
