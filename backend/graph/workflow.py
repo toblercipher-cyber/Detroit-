@@ -1,41 +1,19 @@
 """The LangGraph workflow: the Agent/Workflow Router.
 
-WHY THIS FILE EXISTS
-    This is where stage transitions live. It decides which node runs next, carries
-    ``ProjectState`` between them, and is where HITL interrupts will pause the run.
-    Keeping that in one graph — rather than as control flow scattered through service
-    functions — is what makes the pipeline auditable and resumable.
+Owns stage transitions and HITL pauses. This is the server-side router for
+nodes and agent roles — nothing to do with React Router (CLAUDE.md 3A).
 
-    To be unambiguous: this is the **Agent/Workflow Router**. It routes workflow nodes
-    and agent roles on the server. It has nothing to do with React Router, which
-    routes URL paths in the browser (CLAUDE.md 3A).
+``ProjectState`` IS the graph state. Each node returns only the fields it owns
+and reads its inputs through the ContextBuilder (docs/state.md 3).
 
-LAYER
-    Graph (``backend/graph/``). Depends on agents, context and schemas. It imports
-    nothing from api or main; the API drives the graph, not the reverse.
+11 of 12 stages are wired; ``external_action`` is not, because it needs MCP.
+Missing stages are never stubbed — a placeholder returning success would let a
+run report progress through stages that never happened.
 
-STATE
-    ``ProjectState`` IS the graph state — there is no second model. Each node returns
-    a **partial update containing only the fields it owns**, and the node reads its
-    inputs through the ContextBuilder rather than helping itself to the whole object
-    (docs/state.md 3).
+The checkpointer is injected, never constructed here. With ``None`` the graph
+has no durability and pending gates are lost on restart.
 
-CURRENT EXTENT — deliberately incomplete
-    Only ``requirement_analysis`` is wired, because it is the only role implemented.
-    The remaining stages in ``docs/state.md`` 4 are NOT stubbed: a placeholder node
-    that returns success would let a run report progress through stages that never
-    happened, which is precisely the silent downgrade CLAUDE.md 26 forbids. Each
-    stage is added when its agent exists.
-
-CHECKPOINTER — an open decision, deliberately not made here
-    ``docs/state.md`` 5.1 records that the interim checkpointer is undecided pending
-    the Supabase persistence architecture, and that neither option may be assumed.
-    So this module **accepts** a checkpointer and never constructs one. Passing
-    ``None`` compiles a graph with no durability: pending HITL gates will not survive
-    a restart. That is acceptable for development and must not ship.
-
-Spec: docs/state.md 3, 4, 5.1; docs/workflow.md 1; docs/architecture.md 3.3, 3.7;
-      CLAUDE.md 3A, 26.
+Spec: docs/state.md 3, 4, 5.1; docs/workflow.md 1; docs/architecture.md 3.3, 3.7.
 """
 
 from __future__ import annotations
@@ -146,12 +124,7 @@ _FAILURE_TO_ERROR_CODE: dict[AgentFailureKind, ErrorCode] = {
 
 @dataclass(frozen=True)
 class WorkflowDependencies:
-    """Everything the graph needs, injected rather than constructed.
-
-    Nodes therefore reach for nothing global: a test can build the graph with a stub
-    agent and no network, and the composition root stays the only place that knows
-    how the pieces fit (CLAUDE.md 29).
-    """
+    """Injected collaborators, so nodes reach for nothing global."""
 
     context_builder: ContextBuilder
     requirement_analyzer: RequirementAnalyzerAgent
@@ -194,11 +167,7 @@ def _utcnow() -> datetime:
 
 
 def _failure_update(stage: WorkflowStage, failure: AgentFailure) -> dict[str, Any]:
-    """Record a failed stage in state instead of raising out of the graph.
-
-    The run stops and the user is told; the workflow does not route around the
-    failure or pretend the stage completed (CLAUDE.md 26).
-    """
+    """Record a failure in state rather than raising, so the reason survives."""
     code = _FAILURE_TO_ERROR_CODE.get(failure.kind, ErrorCode.INTERNAL_ERROR)
     logger.warning(
         "stage failed stage=%s kind=%s attempts=%d",
@@ -355,25 +324,11 @@ async def design_node(state: ProjectState, deps: WorkflowDependencies) -> dict[s
 async def reference_analysis_node(
     state: ProjectState, deps: WorkflowDependencies
 ) -> dict[str, Any]:
-    """Read design intent out of an uploaded reference image.
+    """Read design intent from the most recent uploaded reference image.
 
-    Owns: ``reference_analysis``. Optional — the router decides whether this runs
-    at all; by the time it does, an image is guaranteed to exist
-    (docs/workflow.md 1).
-
-    THE IMAGE IS LOADED HERE, NOT CARRIED IN STATE
-        ``ProjectState`` holds a ``ReferenceImageRef``: id, type, size, checksum.
-        Analysis needs pixels, and a checksum cannot be looked at. The bytes are
-        read from the repository for this one call and discarded, so base64 never
-        enters ``project_state.json`` (docs/state.md 5.1).
-
-    WHICH IMAGE
-        The most recent upload. Uploading again is how a user replaces a
-        reference, so the newest is the one they mean; the analyzer takes one
-        image and inventing a merge across several would be fabrication.
-
-    The image is untrusted. Text visible inside it is data, never instruction —
-    the agent's own prompt carries that guard (docs/security.md 5).
+    The bytes are loaded here and discarded: state holds only a checksum, and
+    base64 must never enter project_state.json. Optional stage — the router
+    decides whether it runs, so an image is guaranteed by the time it does.
     """
     stage = WorkflowStage.REFERENCE_ANALYSIS
     refinement = state.node_scratch.get(_INSTRUCTION_KEYS[stage])
@@ -453,28 +408,11 @@ async def reference_analysis_node(
 async def frontend_architecture_node(
     state: ProjectState, deps: WorkflowDependencies
 ) -> dict[str, Any]:
-    """Decide what components exist and how they nest, before anything is written.
+    """Decide what components exist and how they nest. No gate (docs/workflow.md 1).
 
-    Owns: ``frontend_architecture`` and ``component_tree``.
-
-    NO GATE AFTER THIS STAGE
-        ``docs/workflow.md`` 1 marks it "no". The user has already approved the
-        plan, the design system and — when there was one — the reference reading.
-        Architecture follows from those three; asking for a fourth approval of a
-        component list would be a checkpoint without a decision in it
-        (CLAUDE.md 11).
-
-    WHY TWO FIELDS ARE WRITTEN
-        The agent returns one ``FrontendArchitecture``, which nests the tree.
-        ``ProjectState`` keeps ``component_tree`` at the top level as well,
-        because the Builder's context grant names that field directly. Lifting it
-        here is what makes the Builder's slice resolvable; leaving it nested would
-        hand the Builder an empty tree while the data sat one level down.
-
-    COMPONENT INVENTORY
-        Supplied only when the project has files. On a first pass there are none,
-        and the agent is told so explicitly rather than left to infer it. On a
-        later pass the inventory is what makes "reuse before new" enforceable.
+    Writes ``component_tree`` as well as ``frontend_architecture``: the Builder's
+    context grant names the top-level field, so leaving the tree nested inside
+    the architecture would hand the Builder an empty one.
     """
     stage = WorkflowStage.FRONTEND_ARCHITECTURE
 
@@ -520,32 +458,11 @@ async def frontend_architecture_node(
 
 
 async def build_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, Any]:
-    """Write the approved architecture into a workspace and compile it.
+    """Scaffold, let the Builder write src/, then compile. No gate.
 
-    Owns: ``generated_files`` and ``build_status``. No gate after it
-    (``docs/workflow.md`` 1) — nothing here is a decision the user makes; a build
-    either compiles or it does not, and what they review is the preview.
-
-    THREE THINGS HAPPEN, IN THIS ORDER
-        1. Scaffold. Builder-owned config is rewritten every time, so a model that
-           somehow altered one does not get to build against its own version
-           (docs/architecture.md 5.2).
-        2. The Builder agent writes under ``src/``. It holds a handle to this one
-           workspace and can express nothing outside it.
-        3. The toolchain runs: install, typecheck, build. Real exit codes decide.
-
-    A FAILED BUILD IS A RESULT, NOT AN EXCEPTION
-        Generated code failing to compile is the ordinary case this pipeline
-        exists to detect and fix. It is recorded in ``build_status`` with a
-        sanitized message so the Fixer has something to act on, and the stage is
-        marked failed so the workflow stops rather than previewing nothing
-        (CLAUDE.md 26).
-
-    WHAT IS RECORDED IS WHAT HAPPENED
-        ``generated_files`` comes from the writes the workspace tool actually
-        performed, not from what the model said it wrote. The agent's own
-        ``BuildResult`` is assembled the same way, which is why the two cannot
-        disagree.
+    Scaffolding runs every time, so builder-owned config cannot be built against
+    a model-altered version. A failed build is recorded rather than raised, and
+    ``generated_files`` is read from disk, not from what the model claimed.
     """
     stage = WorkflowStage.BUILD
     started = _utcnow()
@@ -616,34 +533,11 @@ async def build_node(state: ProjectState, deps: WorkflowDependencies) -> dict[st
 
 
 def preview_node(state: ProjectState, deps: WorkflowDependencies) -> dict[str, Any]:
-    """Publish the built output and record where it can be seen.
+    """Record where the built output can be seen. No agent, no gate.
 
-    Owns: ``preview_status``. No agent and no gate (``docs/workflow.md`` 1) —
-    there is no judgement here, only the fact of what was built. It is
-    synchronous because nothing in it awaits anything.
-
-    THE URL IS RELATIVE, DELIBERATELY
-        ``/preview/{project_id}/`` rather than an absolute URL. The backend does
-        not know the origin it is reached on — behind a proxy, a tunnel, or a
-        different port, ``api_host``/``api_port`` describe where it *listens*,
-        not where a browser finds it. Baking those into stored state would
-        produce a value that is wrong everywhere except one deployment, and
-        wrong in a field that is persisted. The client resolves it against the
-        origin it already used.
-
-    FRESHNESS
-        ``fresh`` here, and that is a statement about this moment: the preview
-        was just produced from the current files. It becomes ``stale`` when
-        source changes afterwards — which happens in the Targeted Fix stage, so
-        the transition belongs there, with the code that changes the files.
-        ``PreviewStatus`` carries no snapshot to compare against, so this node
-        cannot compute staleness and does not pretend to.
-
-    A MISSING dist/ IS A FAILURE, NOT AN EMPTY PREVIEW
-        The Build node already treats "succeeded but produced nothing" as a
-        failure, so reaching here without output means something removed it
-        between stages. Recording a preview URL that serves 404 would send the
-        user, and the Visual & UX Critic, to look at nothing.
+    The URL is relative: the backend does not know the origin a browser reaches
+    it on, so an absolute one would be wrong outside a single deployment.
+    Staleness is not computed here — nothing changes files until Targeted Fix.
     """
     stage = WorkflowStage.PREVIEW
     dist_dir = deps.repository.workspace_dir(state.project_id) / "dist"
@@ -683,15 +577,10 @@ async def evaluation_node(
 async def re_evaluation_node(
     state: ProjectState, deps: WorkflowDependencies
 ) -> dict[str, Any]:
-    """The same gate, run again after a Targeted Fix.
+    """The same gate after a Targeted Fix; only the recorded stage differs.
 
-    ``docs/workflow.md`` 1 lists Re-evaluation as "same as Evaluation" with
-    updated findings, so it delegates rather than duplicating: two copies of a
-    mandatory gate is two places for it to drift, and the one that drifts is
-    the one nobody is reading.
-
-    Only the recorded stage differs, which is what lets the user and the audit
-    trail tell a first look from a re-check.
+    Delegates rather than duplicating: two copies of a mandatory gate is two
+    places for it to drift.
     """
     return await _evaluate(state, deps, WorkflowStage.RE_EVALUATION)
 
@@ -699,36 +588,11 @@ async def re_evaluation_node(
 async def _evaluate(
     state: ProjectState, deps: WorkflowDependencies, stage: WorkflowStage
 ) -> dict[str, Any]:
-    """Run the mandatory quality gate, or report honestly that it cannot run.
+    """Run the mandatory quality gate, or report that it cannot run.
 
-    Owns: ``evaluation_results``.
-
-    THE GATE IS BLOCKING AND HAS NO SUBSTITUTE
-        ``CLAUDE.md`` 15 and ``docs/design.md`` 5.1 are unusually explicit: if
-        Impeccable is unavailable, STOP and report the gate as blocked. An
-        agent-only review may add interpretation *on top of* Impeccable
-        findings; it may never stand in for them, and a blocked gate is never
-        reported as a pass.
-
-        So this node has two outcomes, and "quietly review with agents instead"
-        is not one of them.
-
-    WHY AVAILABILITY ALONE IS NOT ENOUGH
-        The probe answers "is the tool installed". Running it is a second thing.
-        Until a detector is wired, an installed tool still yields no findings —
-        and reviewers interpreting an empty list would be exactly the agent-only
-        substitute the ruling forbids. Both must hold, so both are checked.
-
-    THE REVIEWERS RUN IN PARALLEL
-        Four independent readings of the same artefact with no ordering between
-        them (``CLAUDE.md`` 6). ``asyncio.gather`` is right here precisely
-        because LangGraph is not: this is fan-out *within* one stage, not a
-        branch in the workflow, so it does not belong in the graph topology.
-
-    FAILURES DO NOT SILENTLY SHRINK THE REVIEW
-        If a reviewer errors, its findings are absent — and a gate that passed
-        because a reviewer crashed would be worse than one that failed. A failed
-        reviewer therefore blocks the gate rather than being dropped.
+    Blocking with no substitute (CLAUDE.md 15): if Impeccable is unavailable,
+    the detector unwired, the preview uncapturable, or any reviewer fails, the
+    gate reports BLOCKED. An agent-only review may never stand in for it.
     """
     status = deps.impeccable_probe()
 
@@ -808,25 +672,9 @@ async def targeted_fix_node(
 ) -> dict[str, Any]:
     """Correct what the gate found, touching only what the findings name.
 
-    Owns: ``iteration_count``. It is the only node permitted to increment it
-    (``docs/state.md`` 3), which is what makes the limit in
-    ``docs/workflow.md`` 4 enforceable from one place.
-
-    THE COUNTER GOES UP EVEN WHEN THE FIX FAILS
-        An attempt that achieved nothing still consumed an attempt. Not
-        counting it would let a repeatedly-failing Fixer loop forever while the
-        budget never moved — the exact runaway the limit exists to stop.
-
-    SCOPE
-        The Fixer is granted the findings and the changed files, and nothing
-        else (``docs/agents.md`` 4.11). It writes under ``src/`` through the
-        same workspace tool the Builder uses, so "fix the hero" cannot become
-        "rewrite the project" (``docs/workflow.md`` 5).
-
-    WHAT IS RECORDED IS WHAT HAPPENED
-        ``FixResult`` is assembled by the agent from the writes the tool
-        actually performed, and ``generated_files`` is re-read from disk
-        afterwards. Neither is the model's account of its own work.
+    The only node that may increment ``iteration_count``, which is what makes
+    the limit enforceable from one place. The counter goes up even when the fix
+    FAILS — otherwise a failing Fixer loops forever on an unmoved budget.
     """
     stage = WorkflowStage.TARGETED_FIX
     findings = list(state.evaluation_results.findings) if state.evaluation_results else []
@@ -892,12 +740,10 @@ async def targeted_fix_node(
 
 
 def _read_source(workspace_dir: Path, relative: str) -> str:
-    """One generated file's text, or empty when it cannot be read.
+    """One generated file's text, or empty when unreadable.
 
-    The Fixer needs the actual content, not a path: it is editing this code.
-    An unreadable file yields an empty string rather than raising, because one
-    missing file should not abandon a fix for the others — and the agent is
-    told plainly what it was given.
+    The Fixer is editing this code, so it needs content rather than a path. One
+    missing file should not abandon the fix for the others.
     """
     try:
         return (workspace_dir / relative).read_text(encoding="utf-8")
@@ -911,13 +757,8 @@ def final_validation_node(
 ) -> dict[str, Any]:
     """Summarise what was produced, for the user's final review.
 
-    No agent: ``docs/workflow.md`` 1 marks this stage *(harness)*. Everything
-    here is already known — what was built, what the gate said, where to look.
-    Asking a model to restate facts the harness holds would add a place for
-    them to be restated wrongly.
-
-    This stage DOES have a gate (the final review), which is the last point
-    before any external action.
+    No agent (docs/workflow.md 1): everything here is already known, and asking
+    a model to restate it only adds a place for it to be restated wrongly.
     """
     stage = WorkflowStage.FINAL_VALIDATION
     report = state.evaluation_results
@@ -981,11 +822,8 @@ def _blocked_gate(
 ) -> dict[str, Any]:
     """The blocked outcome, recorded so it cannot be mistaken for a result.
 
-    ``EvaluationReport`` enforces the invariant that an unavailable gate cannot
-    be ``passed``; this writes the rest of the picture. ``run_status`` becomes
-    ``BLOCKED`` rather than ``FAILED`` because nothing is broken — a required
-    tool is missing, and the distinction is what tells the user whether to fix
-    code or install something (docs/design.md 5.3).
+    BLOCKED rather than FAILED: nothing is broken, a required tool is missing,
+    and that tells the user whether to fix code or install something.
     """
     return {
         "evaluation_results": EvaluationReport(
@@ -1009,12 +847,7 @@ async def _run_reviewers(
     deps: WorkflowDependencies,
     detector_findings: list[EvaluationFinding],
 ) -> tuple[list[EvaluationFinding], bool]:
-    """Run the four reviewers concurrently and merge what they return.
-
-    Each gets only what its role is granted: the critic and the accessibility
-    reviewer see the rendered preview, the anti-slop reviewer additionally sees
-    the detector's findings to interpret, and the code reviewer sees changed
-    files and nothing else (docs/agents.md 4.6-4.10).
+    """Run the four reviewers concurrently; each gets only what its role grants.
 
     Returns the merged findings and whether any reviewer failed.
     """
@@ -1092,12 +925,10 @@ def _workspace_manifest(workspace_dir: Path) -> list[FileRef]:
 def _build_failure(
     stage: WorkflowStage, started: datetime, step: str, message: str
 ) -> dict[str, Any]:
-    """Record a build failure in both ``build_status`` and the stage error.
+    """Record a build failure in both ``build_status`` and ``last_error``.
 
-    Two places because they answer different questions: ``build_status`` says
-    which step broke, and ``last_error`` is what the API surfaces. The message is
-    already sanitized by the runner; nothing raw reaches either
-    (docs/architecture.md 5.5).
+    They answer different questions: which step broke, versus what the API
+    surfaces. The runner already sanitized the message.
     """
     update = _failure_update(
         stage, AgentFailure(AgentFailureKind.CONTRACT_VIOLATION, message)
@@ -1122,28 +953,12 @@ def _gate_node(
 ) -> dict[str, Any]:
     """Pause for the user to approve, redirect or reject a stage result.
 
-    One implementation for every gate. The gates differ only in which stage they
-    belong to and what they are reviewing; the mechanics — raising a checkpoint,
-    interrupting, recording the decision — are identical, and writing them twice is
-    how two gates end up behaving differently by accident.
+    One implementation for every gate, so two gates cannot drift apart. Owns
+    ``pending_checkpoint``, ``hitl_history`` and ``approved_decisions``, and
+    requires a checkpointer because ``interrupt()`` resumes by re-running.
 
-    This is the HITL boundary. It owns ``pending_checkpoint``, ``hitl_history`` and
-    ``approved_decisions``, and is the only path permitted to write the latter two
-    (docs/state.md 3).
-
-    Requires a checkpointer: ``interrupt()`` resumes by re-running the node, which is
-    only possible if the paused run was persisted (docs/state.md 5.1).
-
-    WHICH CHECKPOINT ID GETS RECORDED
-        Resuming re-executes this node from the top, so the ``HitlCheckpoint`` below
-        is rebuilt with a **fresh** id before ``interrupt()`` returns the stored
-        decision. Recording that rebuilt id would file the decision against a gate
-        the user never saw, and the audit trail would not join back to the review.
-
-        The id the user answered survives on the decision itself, so the records use
-        ``decision.checkpoint_id``. It is not taken on trust: the service verifies it
-        against the pending checkpoint before resuming, and a mismatch is rejected as
-        ``checkpoint_already_resolved`` rather than reaching this node.
+    Records ``decision.checkpoint_id``, not the local one: resuming re-runs this
+    node from the top and mints a fresh id the user never saw.
     """
     checkpoint = HitlCheckpoint(
         stage=stage,
@@ -1306,14 +1121,9 @@ def route_after_preview(state: ProjectState) -> str:
 def route_after_evaluation(state: ProjectState, max_iterations: int) -> str:
     """Decide what a quality verdict means for the run.
 
-    Four outcomes, and the two that stop are as important as the two that move:
-
-    - **passed** → Final Validation.
-    - **blocked** → stop. ``CLAUDE.md`` 15: never continue as though it passed.
-    - **failed**, under the limit → Targeted Fix.
-    - **failed**, at the limit → stop and surface the unresolved findings
-      (``docs/workflow.md`` 4). Not another variation: "after repeated
-      rejection of the same thing, surface the conflict".
+    passed -> validate; blocked -> stop, never continue as though it passed
+    (CLAUDE.md 15); failed -> fix while under the limit, otherwise stop and
+    surface the findings rather than producing another variation.
     """
     report = state.evaluation_results
     if report is None or report.gate_status == "blocked":
@@ -1331,12 +1141,10 @@ def route_after_evaluation(state: ProjectState, max_iterations: int) -> str:
 
 
 def route_after_design_gate(state: ProjectState) -> str:
-    """Approval goes to Reference Analysis only when there is an image to read.
+    """Approval reaches Reference Analysis only when an image was uploaded.
 
-    This is the conditional in `docs/workflow.md` 1. With no upload the stage is
-    skipped **entirely** — not run against nothing, and not stubbed — because an
-    analysis with no image would be invention, and a gate asking the user to
-    approve it would be worse.
+    With no upload the stage and its gate are skipped entirely: an analysis
+    with no image would be invention (docs/workflow.md 1).
     """
     decision = route_after_gate(state)
     if decision == "approved" and not state.reference_images:
@@ -1347,12 +1155,8 @@ def route_after_design_gate(state: ProjectState) -> str:
 def route_after_gate(state: ProjectState) -> str:
     """Advance on approval, re-run the stage on a revision, stop on a failure.
 
-    Shared by every gate. Where "revise" goes is decided by the edge map, not here,
-    so one router serves them all.
-
-    A custom instruction or a rejection re-runs the stage **in place** rather than
-    advancing, which keeps a refinement a revision instead of a new stage
-    (docs/workflow.md 3).
+    Shared by every gate; where "revise" goes is decided by the edge map. A
+    revision re-runs the stage in place rather than advancing.
     """
     if state.run_status is RunStatus.FAILED:
         return "stop"
@@ -1365,17 +1169,8 @@ def route_after_gate(state: ProjectState) -> str:
 def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = None):
     """Compile the workflow graph.
 
-    Args:
-        deps: injected collaborators for the nodes.
-        checkpointer: a LangGraph checkpointer, or ``None``. **Not chosen here** —
-            the interim checkpointer is an open decision (docs/state.md 5.1). With
-            ``None`` the graph has no durability and a pending HITL gate is lost on
-            restart.
-
-    Returns:
-        The compiled graph. Invoke it with
-        ``config={"configurable": {"thread_id": project_id}}`` so a run is addressed
-        by its project (docs/state.md 3).
+    Invoke with ``config={"configurable": {"thread_id": project_id}}``. With no
+    checkpointer the graph has no durability and pending gates are lost.
     """
     graph = StateGraph(ProjectState)
 
