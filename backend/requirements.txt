@@ -55,6 +55,16 @@ pydantic-settings==2.15.0
 # "Deferred" section at the end of this file.
 langgraph==1.2.12
 
+# Durable checkpointer. Replaces the interim InMemorySaver, whose known
+# limitation was that a restart lost every pending HITL gate
+# (docs/state.md 5.1-5.2). Brings psycopg with it, pinned below.
+#
+# NOTE: it has no schema option -- its migrations CREATE TABLE unqualified, so
+# the tables land wherever search_path points. backend/db/engine.py pins that
+# to a dedicated schema; see the long note there for why that is a containment
+# boundary and not tidiness.
+langgraph-checkpoint-postgres==3.1.2
+
 # --- LLM provider (Anthropic Claude only, v1) -------------------------------
 # Prompt composition, runnables and structured-output helpers.
 # (docs/architecture.md 3.5, skills.md 8)
@@ -63,6 +73,17 @@ langchain-core==1.6.4
 # Anthropic Claude binding. Single provider for v1 — one API key serves every
 # agent role. No multi-provider abstraction. (CLAUDE.md 7, skills.md 10)
 langchain-anthropic==1.7.2
+
+# --- PostgreSQL -------------------------------------------------------------
+# psycopg v3, async. Chosen over asyncpg because langgraph-checkpoint-postgres
+# speaks psycopg v3, and two drivers for one database is two connection stories
+# to reason about. [binary] ships the C extension so no local build toolchain is
+# needed; [pool] is the async connection pool backend/db/engine.py builds on.
+#
+# Deliberately NOT SQLAlchemy or any ORM: the StateRepository Protocol plus
+# psycopg is the whole persistence stack, and an ORM would add a second schema
+# definition to keep in sync with the Pydantic models (CLAUDE.md 9A).
+psycopg[binary,pool]==3.3.6
 
 # --- Outbound HTTP ----------------------------------------------------------
 # Used where the backend must make its own HTTP calls. Also the transport the
@@ -84,6 +105,17 @@ httpx==0.28.1
 # converts into a BLOCKED gate rather than a silent pass.
 playwright==1.63.0
 
+# --- MCP external capability layer ------------------------------------------
+# The official SDK, used by backend/tools/mcp_client.py to connect to an MCP
+# server and discover its real tools. Chosen over langchain-mcp-adapters, which
+# pins mcp<2.0.0 and whose job -- handing MCP tools straight to an agent -- is
+# the thing docs/mcp.md 3 requires us NOT to do.
+#
+# Optional at runtime: docs/mcp.md 1 requires the core workflow to run with zero
+# MCP servers connected, and every SDK import is local to the connect path, so
+# the graph imports without it.
+mcp==2.3.0
+
 # --- Testing ----------------------------------------------------------------
 # Runs the verification suites in backend/tests. Not needed to serve the API, but
 # pinned with everything else so a checkout tests identically.
@@ -98,37 +130,42 @@ pytest==9.1.1
 # DEFERRED — do NOT add without an explicit decision (docs/runtime.md 2.1)
 # ============================================================================
 #
-#   Checkpointer package
-#       Status:      UNDECIDED, deliberately omitted from this manifest.
-#       Why:         The persistence architecture is not final. The database is
-#                    Supabase/PostgreSQL (CLAUDE.md 9A, docs/architecture.md 3.8)
-#                    but its schema is undecided by design, so the checkpointer
-#                    that pairs with it cannot be chosen yet.
-#       Consequence: Until this is resolved, pending HITL gates do not survive a
-#                    process restart (docs/state.md 5.1, 5.2).
-#       Unblocked by: finalizing the persistence architecture with the user.
+#   Supabase client library (@supabase / supabase-py)
+#       Status:      DEFERRED, and may never be needed.
+#       Why:         The backend reaches PostgreSQL directly with psycopg. A
+#                    Supabase client exists to call PostgREST, Storage and the
+#                    Auth admin API -- none of which v1 uses. Supabase Auth is
+#                    verified by JWT, not by an SDK (docs/database.md 1.3.5).
+#       Unblocked by: a requirement that actually needs one of those three.
 #
-#   Supabase client / PostgreSQL driver / migration tool
-#       Status:      DEFERRED until the user defines the database schema.
-#       Rule:        Do not design, invent or scaffold a schema; do not write
-#                    persistence code against an assumed table shape.
-#                    (CLAUDE.md 9A, docs/architecture.md 3.8, docs/state.md 5.0)
+#   JWT verification library (PyJWT[crypto] / joserfc)
+#       Status:      REQUIRED for authentication, NOT YET ADDED.
+#       Why:         The Supabase project signs access tokens with ES256 and
+#                    publishes a JWKS, so verification needs an asymmetric-capable
+#                    library. There is no shared secret to compare against, and
+#                    SUPABASE_JWT_SECRET must not be introduced.
+#       Unblocked by: the auth implementation step.
+#
+#   Migration tool (Alembic or similar)
+#       Status:      NOT CHOSEN. Plain SQL files under backend/db/migrations/
+#                    are the current approach (docs/runtime.md 2.1).
+#       Why:         Alembic is ORM-adjacent and the project has no ORM.
+#
+#   ORM / SQLAlchemy
+#       Status:      NOT PERMITTED. See the psycopg entry above.
 #
 #   Impeccable
-#       Status:      REQUIRED but not installed. Not a pip dependency of this
-#                    backend; it is a separate tool.
-#       Consequence: The Evaluation stage is BLOCKED until it is installed. The
-#                    gate is mandatory and has no substitute; a blocked gate is
-#                    never reported as passed. (CLAUDE.md 15, docs/design.md 5)
+#       Status:      REQUIRED, and INSTALLED -- Claude Code skill 4.3.1 with CLI
+#                    4.0.0. Not a pip dependency; it is a separate tool, which is
+#                    why it is listed here rather than above.
+#       Note:        This entry previously claimed Impeccable was not installed.
+#                    That was wrong, and it mattered: code written to that premise
+#                    would report the mandatory gate blocked forever on a machine
+#                    where the tool works (docs/design.md 5.2).
 #
 #   Zapier client / webhook tooling
 #       Status:      DEFERRED. Optional automation layer only. Not the database,
 #                    not the orchestrator. (CLAUDE.md 19A, docs/mcp.md 2.4)
-#
-#   MCP client library
-#       Status:      Not added yet. No MCP server is connected in v1, and the
-#                    core workflow must run with zero MCP servers.
-#                    (docs/mcp.md 1)
 #
 #   RAG stack (vector store, embeddings, document loaders)
 #       Status:      DEFERRED. Nothing in v1 scope requires retrieval.

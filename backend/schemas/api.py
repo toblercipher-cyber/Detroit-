@@ -80,6 +80,13 @@ class ErrorCode(str, Enum):
     """
 
     VALIDATION_ERROR = "validation_error"
+    # No usable access token: absent, malformed, expired, wrong issuer or
+    # audience. Never used for "this is not yours" -- that is a 404, so the
+    # endpoint cannot be used to probe which project ids exist (docs/api.md 1.1).
+    UNAUTHENTICATED = "unauthenticated"
+    # A verified caller attempting something their account may not do. Reserved;
+    # ownership is deliberately NOT expressed with it.
+    FORBIDDEN = "forbidden"
     PROJECT_NOT_FOUND = "project_not_found"
     INVALID_STAGE_FOR_ACTION = "invalid_stage_for_action"
     NO_PENDING_CHECKPOINT = "no_pending_checkpoint"

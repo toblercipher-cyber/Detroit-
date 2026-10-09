@@ -12,19 +12,39 @@ LAYER
     import.
 
 WHAT BELONGS HERE
-    The 16 environment variables defined in ``docs/runtime.md`` 3.2, their types,
-    their defaults, and their validation.
+    The environment variables defined in ``docs/runtime.md`` 3.2, plus the database
+    group that ``docs/database.md`` unblocked, with their types, defaults and
+    validation.
 
 WHAT DOES NOT BELONG HERE
     - The per-role Claude temperature / max-token policy table (``docs/runtime.md``
       4.1). That is a static policy table, not environment configuration, and belongs
       in its own module under ``backend/config/``.
-    - Database configuration. The database is Supabase/PostgreSQL but its schema is
-      undecided by design, so no connection settings exist yet.
+    - The connection pool, the engine, or the LangGraph checkpointer itself. This
+      module declares and validates the DSN; opening a connection with it belongs to
+      the persistence layer under ``backend/db/``. Configuration that dialled out to
+      a network service on import would make this module untestable and would give
+      it two jobs.
+    - Any SQL. Application tables are ``docs/database.md`` 3; LangGraph's checkpoint
+      tables are LangGraph's own and are never written by hand (``docs/database.md``
+      1.2).
     - Any Impeccable enable/disable flag. Impeccable is a mandatory gate, not a
       feature toggle; a switch that could silently disable it must never exist.
 
-Spec: docs/runtime.md 3.2, 3.4, 6; docs/security.md 2, 9; skills.md 25, 26.
+WHY THE DATABASE GROUP EXISTS NOW
+    ``CLAUDE.md`` 9A withheld every database setting "until the schema is defined
+    and approved". ``docs/database.md`` is that definition and records it as
+    approved, and the user has provisioned the Supabase project. So the gate is
+    satisfied for *configuration*; it is not satisfied for tables, migrations or
+    auth, none of which appear here.
+
+    These five variables are also already present in ``.env``. Because
+    ``extra="forbid"`` below is deliberate, an undeclared key is a hard startup
+    failure rather than a silent default — so declaring them is what lets the
+    backend boot at all.
+
+Spec: docs/runtime.md 3.2, 3.4, 6; docs/database.md 1, 5, 6; docs/security.md 2, 9;
+      docs/state.md 5.0, 5.1; skills.md 25, 26.
 """
 
 from __future__ import annotations
@@ -41,6 +61,18 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # copying the example to .env without editing fails at startup with a clear message,
 # rather than surfacing later as a confusing provider authentication error.
 PLACEHOLDER_API_KEY = "replace-with-your-anthropic-api-key"
+
+# Supabase hands out a connection string with the password left as a literal
+# bracketed placeholder. Pasting it unedited is the single most common way to get a
+# DSN that parses but cannot connect, so it is rejected by name at startup instead
+# of failing later as an opaque authentication error. Compared case-insensitively.
+PLACEHOLDER_DB_PASSWORDS = ("[your-password]", "[yourpassword]", "[password]")
+
+# Schemes the persistence layer can actually open. psycopg v3 and
+# langgraph-checkpoint-postgres both take a plain libpq URI; a SQLAlchemy-style
+# "postgresql+asyncpg://" would be accepted by neither, so it is refused here where
+# the message can say why rather than surfacing as a driver error.
+VALID_DB_SCHEMES = ("postgresql://", "postgres://")
 
 # Hosts that keep the API unreachable from outside this machine. Required while there
 # is no authentication (docs/security.md 9).
@@ -145,6 +177,66 @@ class Settings(BaseSettings):
         description="Root for checkpoints, state artifacts, uploads, workspaces.",
     )
 
+    # --- Database: Supabase-hosted PostgreSQL (docs/database.md) ---
+    #
+    # OPTIONAL ON PURPOSE. The durable store is prepared, not switched on: with no
+    # DSN the backend keeps running on the filesystem repository and the
+    # InMemorySaver that docs/state.md 5.1 records as interim. Making this required
+    # would turn a half-finished migration into a backend that refuses to boot, and
+    # the persistence layer that consumes it does not exist yet.
+
+    database_url: SecretStr | None = Field(
+        default=None,
+        description=(
+            "libpq URI for the Supabase PostgreSQL instance, used by both the "
+            "durable StateRepository and the LangGraph checkpointer. SECRET: the "
+            "password is embedded in the DSN, so this is a credential, not a "
+            "location."
+        ),
+    )
+
+    database_url_app: SecretStr | None = Field(
+        default=None,
+        description=(
+            "libpq URI for the RESTRICTED application role (detroit_app, "
+            "NOBYPASSRLS). Used for every query against the six public tables, "
+            "with the caller's verified claims set per transaction. SECRET."
+        ),
+    )
+
+    # The remaining four are present in .env because the Supabase project ships
+    # them. v1 uses NONE of them, and that is a decision rather than an omission:
+    #
+    #   SUPABASE_URL / SUPABASE_PUBLISHABLE_KEY  address the PostgREST, Auth and
+    #       Storage APIs. docs/database.md 1.3 defers auth entirely and 4 keeps
+    #       reference-image bytes on the filesystem, so no Supabase client exists.
+    #   SUPABASE_SERVICE_ROLE_KEY                bypasses row-level security
+    #       completely. Nothing reads it today, and nothing should start to without
+    #       an explicit decision — docs/security.md 7 is least privilege, and this
+    #       key is the opposite of that.
+    #   SUPABASE_DB_PASSWORD                     is already inside DATABASE_URL.
+    #       Kept so .env stays the shape Supabase generated; never read separately,
+    #       because two copies of one credential is two chances to leak it.
+    #
+    # They are declared so startup succeeds under extra="forbid", and typed as
+    # SecretStr so an accidental log or traceback cannot print them.
+
+    supabase_url: str | None = Field(
+        default=None,
+        description="Supabase project API URL. Not a secret, and unused in v1.",
+    )
+    supabase_publishable_key: SecretStr | None = Field(
+        default=None, description="Anon/publishable key. Unused in v1."
+    )
+    supabase_service_role_key: SecretStr | None = Field(
+        default=None,
+        description="SECRET: full-access key that bypasses RLS. Unused in v1.",
+    )
+    supabase_db_password: SecretStr | None = Field(
+        default=None,
+        description="SECRET: already embedded in DATABASE_URL. Unused separately.",
+    )
+
     # --- Reference image uploads (docs/api.md 2.4, docs/security.md 4) ---
 
     max_upload_bytes: int = Field(default=10_485_760, gt=0)
@@ -193,12 +285,83 @@ class Settings(BaseSettings):
             )
         return value
 
+    @field_validator("database_url", "database_url_app")
+    @classmethod
+    def _check_database_url(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject a DSN that cannot work, while never echoing it.
+
+        Three failures are caught here because each one otherwise surfaces much
+        later as something that does not name its cause:
+
+        1. A wrong scheme. ``postgresql+asyncpg://`` is SQLAlchemy syntax; psycopg
+           and the LangGraph checkpointer both take a plain libpq URI and would
+           fail on it inside a driver.
+        2. The unedited Supabase password placeholder, which produces a DSN that
+           parses perfectly and then cannot authenticate.
+        3. A quoted value. ``DATABASE_URL="postgresql://..."`` leaves the quotes in
+           the string when the shell is not involved, and the result is a hostname
+           with a quote in it.
+
+        Every message names the variable and the problem. None of them includes any
+        part of the value, because the password is inside it (docs/security.md 2, 6).
+        """
+        if value is None:
+            return None
+
+        dsn = value.get_secret_value().strip()
+        if not dsn:
+            # An empty assignment in .env means "not configured", not "misconfigured".
+            return None
+
+        if dsn[0] in "\"'" or dsn[-1] in "\"'":
+            raise ValueError(
+                "DATABASE_URL is wrapped in quotes; remove them so the value is the "
+                "bare URI"
+            )
+
+        if not dsn.lower().startswith(VALID_DB_SCHEMES):
+            raise ValueError(
+                "DATABASE_URL must begin with 'postgresql://' or 'postgres://' "
+                "(a '+driver' suffix is SQLAlchemy syntax and is not supported)"
+            )
+
+        lowered = dsn.lower()
+        if any(ph in lowered for ph in PLACEHOLDER_DB_PASSWORDS):
+            raise ValueError(
+                "DATABASE_URL still contains the Supabase password placeholder; "
+                "substitute the real password and percent-encode any reserved "
+                "characters in it"
+            )
+
+        return value
+
     # --- Derived state and startup checks ---
 
     @property
     def is_loopback_bound(self) -> bool:
         """True when the API is unreachable from outside this machine."""
         return self.api_host in LOOPBACK_HOSTS
+
+    @property
+    def is_app_role_configured(self) -> bool:
+        """True when the restricted application role has a DSN.
+
+        Separate from :attr:`is_database_configured` because the two pools fail
+        independently: the checkpointer can be durable while owner-scoped
+        storage is not yet wired, which is exactly the state during migration.
+        """
+        return self.database_url_app is not None
+
+    @property
+    def is_database_configured(self) -> bool:
+        """True when a DSN is present for the durable PostgreSQL store.
+
+        The one predicate the composition root should branch on when choosing
+        between the durable store and the interim filesystem + InMemorySaver pair,
+        so that choice is made in exactly one place rather than re-derived from a
+        ``None`` check at each call site (docs/state.md 5.0).
+        """
+        return self.database_url is not None
 
     def ensure_data_dir(self) -> Path:
         """Create the builder data directory if needed and confirm it is writable.
@@ -237,6 +400,15 @@ class Settings(BaseSettings):
             warnings.append(
                 "APP_ENV is 'production' but v1 has no authentication layer "
                 "(docs/api.md 1.1)."
+            )
+        if not self.is_database_configured:
+            # Surfaced loudly because the consequence is easy to mistake for a bug:
+            # a gate opens, the process restarts, and the run is unanswerable. That
+            # is the known limitation docs/state.md 5.1 records, not a fault.
+            warnings.append(
+                "DATABASE_URL is not set. Running on the interim filesystem "
+                "repository and the in-process checkpointer: every pending HITL "
+                "gate is lost on restart (docs/state.md 5.1)."
             )
         return warnings
 

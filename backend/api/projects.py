@@ -13,6 +13,18 @@ LAYER
     API (``backend/api/``). Depends on schemas and services. It is imported by
     ``main.py``, which composes it; it imports nothing from ``main``.
 
+AUTHENTICATION AND OWNERSHIP
+    Every route below takes ``get_scoped_service``, which verifies the bearer
+    token and returns a service restricted to that caller. Consequences:
+
+    - Identity is never read from a path, query or body. The ``project_id`` in
+      a path says WHICH project; the token says WHOSE (docs/api.md 1.1).
+    - Another user's project answers 404, identically to one that does not
+      exist. Under RLS the row is simply not visible, so this needs no special
+      case -- and a 403 would confirm the id exists.
+    - A missing or invalid token is 401 ``unauthenticated``, in the same error
+      envelope as everything else.
+
 ERROR TRANSLATION
     Service and repository errors are raised as ``HTTPException`` with a status code.
     ``main.py`` wraps every one of those in the single documented ``ErrorResponse``
@@ -45,6 +57,7 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
+from backend.api.deps import get_project_service, get_scoped_service
 from backend.memory.artifacts import InvalidProjectIdError, ProjectNotFoundError
 from backend.schemas.api import (
     CreateProjectRequest,
@@ -74,21 +87,10 @@ from backend.services.projects import (
 router = APIRouter(prefix="/api/v1/projects", tags=["projects"])
 
 
-def get_project_service(request: Request) -> ProjectService:
-    """Resolve the service from application state.
-
-    Composition stays in ``main.py``: this module never constructs a repository, a
-    workflow or settings, so a test can mount the router with a stub service.
-    """
-    service: ProjectService | None = getattr(
-        request.app.state, "project_service", None
-    )
-    if service is None:  # pragma: no cover - a wiring mistake, not a runtime path
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Project service is not configured.",
-        )
-    return service
+# Resolving the service now goes through backend/api/deps.py, which returns one
+# already bound to the verified caller. Re-exported so existing imports of
+# `get_project_service` from this module keep working.
+__all__ = ["router", "get_project_service"]
 
 
 def _load(service: ProjectService, project_id: str) -> ProjectState:
@@ -109,7 +111,7 @@ def _load(service: ProjectService, project_id: str) -> ProjectState:
 async def create_project(
     payload: CreateProjectRequest,
     background_tasks: BackgroundTasks,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> ProjectCreatedResponse:
     """Create a project and start Requirement Analysis.
 
@@ -132,7 +134,7 @@ async def create_project(
 
 @router.get("", response_model=ProjectSummaryList)
 async def list_projects(
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> ProjectSummaryList:
     """Stored projects, newest first."""
     return ProjectSummaryList(
@@ -152,7 +154,7 @@ async def list_projects(
 @router.get("/{project_id}", response_model=ProjectStateResponse)
 async def get_project(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> ProjectStateResponse:
     """The public projection of project state.
 
@@ -165,7 +167,7 @@ async def get_project(
 @router.get("/{project_id}/status", response_model=StatusResponse)
 async def get_project_status(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> StatusResponse:
     """Cheap polling endpoint, and the fallback when the event stream is unavailable.
 
@@ -190,7 +192,7 @@ async def get_project_status(
 @router.get("/{project_id}/preview", response_model=PreviewResponse)
 async def get_preview(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> PreviewResponse:
     """Where this project's built output can be viewed, and how current it is.
 
@@ -232,7 +234,7 @@ async def get_preview(
 async def upload_reference_image(
     project_id: str,
     file: UploadFile = File(...),
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> ReferenceImageResponse:
     """Attach a reference image for the Reference Analysis stage.
 
@@ -274,7 +276,7 @@ async def upload_reference_image(
 )
 async def get_pending_checkpoint(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ):
     """The gate the user is being asked to review, or 204 when there is none.
 
@@ -295,7 +297,7 @@ async def get_pending_checkpoint(
 async def submit_hitl_decision(
     project_id: str,
     payload: HitlDecisionRequest,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> HitlDecisionAccepted:
     """Answer the pending gate and resume the workflow.
 
@@ -330,7 +332,7 @@ async def submit_hitl_decision(
 @router.get("/{project_id}/hitl/history", response_model=HitlHistoryResponse)
 async def get_hitl_history(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> HitlHistoryResponse:
     """Every decision taken on this project, oldest first.
 
@@ -344,7 +346,7 @@ async def get_hitl_history(
 @router.delete("/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project(
     project_id: str,
-    service: ProjectService = Depends(get_project_service),
+    service: ProjectService = Depends(get_scoped_service),
 ) -> None:
     """Delete a project and everything under it.
 

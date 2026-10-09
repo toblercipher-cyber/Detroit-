@@ -43,6 +43,12 @@ from typing import Any
 from langgraph.types import Command
 
 from backend.config.settings import Settings
+from uuid import UUID
+
+from backend.memory.postgres import (
+    OwnerScopedRepository,
+    PostgresStateRepository,
+)
 from backend.memory.artifacts import (
     ProjectNotFoundError,
     StateRepository,
@@ -224,6 +230,53 @@ class ProjectService:
         self._repository = repository
         self._workflow = workflow
         self._settings = settings
+
+    # --- Caller scoping ---------------------------------------------------
+
+    def for_owner(self, owner_id: UUID) -> "ProjectService":
+        """A service whose every operation is restricted to one verified user.
+
+        WHY SCOPING LIVES HERE AND NOT ON EACH METHOD
+            Adding ``owner_id`` to eight methods would mean eighteen call sites
+            inside this class and every caller in the API and the tests. One of
+            them eventually gets missed, and a missed owner argument is a
+            cross-user read. Binding once makes the unscoped version
+            unreachable instead of merely discouraged.
+
+        WHAT HAPPENS IF A ROUTE FORGETS TO CALL THIS
+            It crashes, loudly, and that is deliberate. The unbound service
+            holds a :class:`PostgresStateRepository`, whose methods require a
+            keyword ``owner_id``; calling ``load(project_id)`` on it raises
+            ``TypeError`` before a query is built. There is no code path where
+            a forgotten scope silently returns another user's rows.
+
+        Args:
+            owner_id: ``auth.users.id``, taken from a VERIFIED access token.
+                Never from a path, query string or request body
+                (``docs/api.md`` 1.1).
+        """
+        repository = self._repository
+        if isinstance(repository, PostgresStateRepository):
+            scoped: StateRepository = OwnerScopedRepository(repository, owner_id)
+        elif isinstance(repository, OwnerScopedRepository):
+            # Re-binding an already-bound service would silently widen or
+            # narrow access depending on the argument. Refuse instead.
+            raise ProjectServiceError("This service is already bound to a caller.")
+        else:
+            # Single-user development store. It has no owner column and cannot
+            # enforce isolation, so it is only reachable when no application
+            # database is configured -- main.py refuses that combination in
+            # production. Returning self keeps dev and tests working without
+            # pretending the filesystem is enforcing anything.
+            return self
+        return ProjectService(
+            repository=scoped, workflow=self._workflow, settings=self._settings
+        )
+
+    @property
+    def is_owner_scoped(self) -> bool:
+        """True when this instance is restricted to one user's data."""
+        return isinstance(self._repository, OwnerScopedRepository)
 
     # --- Lifecycle -------------------------------------------------------
 

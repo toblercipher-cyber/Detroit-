@@ -37,7 +37,8 @@ from __future__ import annotations
 import logging
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import AsyncExitStack, asynccontextmanager
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -60,10 +61,13 @@ from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.api import preview as preview_routes
 from backend.api import projects as projects_routes
-from backend.config.settings import Settings, get_settings
+from backend.auth.jwt import SupabaseTokenVerifier
+from backend.config.settings import ConfigurationError, Settings, get_settings
 from backend.context.builder import ContextBuilder
+from backend.db import engine as db_engine
 from backend.graph.workflow import WorkflowDependencies, build_workflow
 from backend.memory.artifacts import JsonArtifactRepository
+from backend.memory.postgres import PostgresStateRepository
 from backend.tools.build_runner import BuildRunner
 from backend.tools.impeccable import probe_impeccable, run_detector
 from backend.tools.preview_capture import capture_preview
@@ -81,9 +85,18 @@ API_PREFIX = "/api/v1"
 
 logger = logging.getLogger("backend")
 
+# Must run BEFORE anything creates an event loop, which is why it is at module
+# scope in the composition root rather than inside lifespan: by the time
+# lifespan runs, uvicorn has already built the loop and the policy no longer
+# applies to it. On Windows that loop is a ProactorEventLoop, which async
+# psycopg refuses to use, so the checkpointer would fail on its first query
+# (docs/state.md 5.0.2). A no-op everywhere else.
+db_engine.configure_event_loop_policy()
+
 # Maps the HTTP status a route raises to a stable machine-readable code. Routes that
 # need a more specific code raise it explicitly rather than relying on this fallback.
 _STATUS_TO_CODE: dict[int, ErrorCode] = {
+    401: ErrorCode.UNAUTHENTICATED,
     403: ErrorCode.APPROVAL_REQUIRED,
     404: ErrorCode.PROJECT_NOT_FOUND,
     409: ErrorCode.INVALID_STAGE_FOR_ACTION,
@@ -159,7 +172,9 @@ def _configure_logging(settings: Settings) -> None:
     )
 
 
-def build_project_service(settings: Settings) -> ProjectService:
+def build_project_service(
+    settings: Settings, checkpointer: Any, repository: Any
+) -> ProjectService:
     """Assemble the object graph for the project workflow.
 
     This is the only place that knows how the layers fit together. Each collaborator
@@ -176,7 +191,11 @@ def build_project_service(settings: Settings) -> ProjectService:
     # importing this module does not require it.
     from langchain_anthropic import ChatAnthropic
 
-    repository = JsonArtifactRepository(settings.builder_data_dir)
+    # The GRAPH gets the filesystem repository: the only thing a node needs
+    # from it is reference-image BYTES, which live on disk either way
+    # (docs/database.md 4). The owner-scoped store is the SERVICE's, so a
+    # node can never perform an unscoped project read.
+    artifacts = JsonArtifactRepository(settings.builder_data_dir)
 
     def model_for(role: AgentRole) -> ChatAnthropic:
         """A chat client configured by the central policy for one role."""
@@ -249,25 +268,113 @@ def build_project_service(settings: Settings) -> ProjectService:
             # The same repository the service uses. Reference Analysis needs the
             # image bytes, which state does not carry; sharing one instance keeps
             # a single view of what is on disk.
-            repository=repository,
+            repository=artifacts,
         ),
-        # Interim development checkpointer, chosen by the user and approved as
-        # interim only (docs/state.md 5.1). A checkpointer is not optional, and the
-        # way it fails without one is worth knowing: the first gate still pauses and
-        # still returns __interrupt__, so a run LOOKS fine — but answering it raises
-        # ``RuntimeError: Cannot use Command(resume=...) without checkpointer``.
-        # The gate is reachable and unanswerable, which is the worst of both.
+        # Injected, not constructed. A checkpointer is not optional, and the way
+        # it fails without one is worth knowing: the first gate still pauses and
+        # still returns __interrupt__, so a run LOOKS fine — but answering it
+        # raises ``RuntimeError: Cannot use Command(resume=...) without
+        # checkpointer``. The gate is reachable and unanswerable.
         #
-        # KNOWN LIMITATION, accepted for development: this store is per-process. A
-        # restart loses every pending HITL gate, which is exactly the restart
-        # survival docs/state.md 5.2 describes. Replacing it with a durable saver is
-        # a one-line change here and touches nothing else — that is the point of
-        # injecting it at the composition root. Supabase/PostgreSQL remains deferred
-        # until the schema is defined (docs/state.md 5.0).
-        checkpointer=InMemorySaver(),
+        # Which saver arrives is decided by ``_open_checkpointer`` below, because
+        # choosing it needs an open event loop and a connection whose lifetime
+        # must end at shutdown. That was always the point of injecting it here.
+        checkpointer=checkpointer,
     )
 
-    return ProjectService(repository=repository, workflow=workflow, settings=settings)
+    return ProjectService(
+        repository=repository, workflow=workflow, settings=settings
+    )
+
+
+async def _open_checkpointer(stack: AsyncExitStack, settings: Settings) -> Any:
+    """The durable checkpointer, or the interim one when no database is set.
+
+    Two outcomes, and the difference between them is deliberate:
+
+    - **No ``DATABASE_URL``.** Fall back to ``InMemorySaver`` and warn. Nothing
+      is misconfigured; the operator simply has not connected a database, and
+      refusing to start would make the backend unusable for anyone who just
+      wants to run the frontend against it. ``settings.startup_warnings()``
+      has already said what that costs.
+
+    - **``DATABASE_URL`` set but unreachable.** Raise, and let startup fail.
+      Setting it is an explicit statement that runs should be durable; quietly
+      degrading to process memory would mean gates silently stop surviving a
+      restart and nobody finds out until one is lost. That is the same
+      fail-fast posture ``get_settings()`` already takes on bad configuration.
+
+    The pool is entered on ``stack``, so its lifetime is exactly the
+    application's and it is closed on shutdown — connections left open are
+    counted against the Supabase project's limit.
+    """
+    if not settings.is_database_configured:
+        logger.warning(
+            "no DATABASE_URL: using the in-process checkpointer. Pending HITL "
+            "gates will NOT survive a restart (docs/state.md 5.1)."
+        )
+        return InMemorySaver()
+
+    checkpointer = await stack.enter_async_context(
+        db_engine.checkpointer_lifespan(settings)
+    )
+    logger.info(
+        "durable checkpointer ready: PostgreSQL, schema=%s",
+        db_engine.CHECKPOINT_SCHEMA,
+    )
+    return checkpointer
+
+
+def _open_repository(stack: AsyncExitStack, settings: Settings) -> Any:
+    """The owner-scoped PostgreSQL store, or the single-user dev store.
+
+    The two are NOT interchangeable and the difference is stated loudly,
+    because a filesystem store silently serving a multi-user deployment is the
+    exact failure this whole change exists to prevent:
+
+    - **``DATABASE_URL_APP`` set.** Use PostgreSQL as ``detroit_app``
+      (NOBYPASSRLS). Rows are owner-scoped and RLS enforces it.
+    - **Not set.** Fall back to the filesystem and warn that there is NO
+      isolation. Acceptable only for single-user local development.
+
+    The pool is closed on shutdown via ``stack``.
+    """
+    artifacts = JsonArtifactRepository(settings.builder_data_dir)
+    if not settings.is_app_role_configured:
+        logger.warning(
+            "DATABASE_URL_APP is not set: project state is on the FILESYSTEM "
+            "with NO per-user isolation. Single-user development only."
+        )
+        return artifacts
+
+    pool = db_engine.create_app_pool(settings.database_url_app.get_secret_value())
+    pool.open(wait=True, timeout=db_engine.POOL_TIMEOUT_SECONDS)
+    stack.callback(pool.close)
+    logger.info("owner-scoped PostgreSQL repository ready (role: detroit_app)")
+    return PostgresStateRepository(pool, artifacts)
+
+
+def _build_verifier(settings: Settings) -> SupabaseTokenVerifier | None:
+    """The token verifier, or None when Supabase Auth is not configured.
+
+    Refusing to start is correct when the combination is unsafe rather than
+    merely incomplete: an owner-scoped database with no way to verify who the
+    owner is would mean every request fails at the dependency, which is a
+    confusing way to discover a missing variable.
+    """
+    if not settings.supabase_url:
+        if settings.is_app_role_configured:
+            raise ConfigurationError(
+                "DATABASE_URL_APP is set but SUPABASE_URL is not. Owner-scoped "
+                "storage cannot work without token verification. Set "
+                "SUPABASE_URL, or unset DATABASE_URL_APP for single-user mode."
+            )
+        logger.warning(
+            "SUPABASE_URL is not set: authentication is DISABLED and every "
+            "project route will answer 503."
+        )
+        return None
+    return SupabaseTokenVerifier(settings)
 
 
 @asynccontextmanager
@@ -293,12 +400,26 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     for warning in settings.startup_warnings():
         logger.warning("%s", warning)
 
-    # Routes resolve the service from application state, so composition stays here
-    # rather than leaking into the route modules.
-    app.state.project_service = build_project_service(settings)
-    logger.info("project service ready")
+    # One stack owns every async resource opened for the application's
+    # lifetime, so shutdown unwinds them in reverse order even if startup
+    # fails partway through.
+    async with AsyncExitStack() as stack:
+        checkpointer = await _open_checkpointer(stack, settings)
+        repository = _open_repository(stack, settings)
+        app.state.token_verifier = _build_verifier(settings)
 
-    yield
+        # Routes resolve the service from application state, so composition
+        # stays here rather than leaking into the route modules.
+        app.state.project_service = build_project_service(
+            settings, checkpointer, repository
+        )
+        logger.info(
+            "project service ready (storage=%s, auth=%s)",
+            "postgres" if settings.is_app_role_configured else "filesystem",
+            "on" if app.state.token_verifier else "OFF",
+        )
+
+        yield
 
     logger.info("backend stopped")
 
@@ -317,14 +438,23 @@ def create_app() -> FastAPI:
         lifespan=lifespan,
     )
 
-    # Explicit origin allowlist. No credentials: there is no authentication in v1, so
-    # nothing should be sending cookies cross-origin (docs/api.md 1.1).
+    # Explicit origin allowlist.
+    #
+    # allow_credentials stays FALSE and that is correct even with auth: the
+    # token travels in an Authorization header, not a cookie, so no credentialed
+    # CORS mode is needed. Turning it on would also forbid a wildcard origin and
+    # widen what a browser will attach to cross-origin requests, for no gain.
+    #
+    # Authorization MUST be listed. A browser preflights any request carrying
+    # it, and an un-allowed header makes that preflight fail with 400 -- which
+    # surfaces in the frontend as "could not reach the backend", pointing at the
+    # network rather than at this list (docs/api.md 1.1).
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST", "DELETE"],
-        allow_headers=["Content-Type"],
+        allow_headers=["Content-Type", "Authorization"],
     )
 
     @app.middleware("http")
