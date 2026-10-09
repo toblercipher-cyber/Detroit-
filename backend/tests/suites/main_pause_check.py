@@ -86,8 +86,10 @@ class FakeChat(Runnable):
 
 langchain_anthropic.ChatAnthropic = FakeChat
 import backend.main as m
+from langgraph.checkpoint.memory import InMemorySaver
 from backend.config.settings import get_settings
-svc = m.build_project_service(get_settings())
+svc = m.build_project_service(get_settings(), InMemorySaver(),
+                              _JAR(get_settings().builder_data_dir))
 
 print("=== 1. Composition root built nine clients, one per role ===")
 print("   clients built:", len(CALLS), ok(len(CALLS) == 9))

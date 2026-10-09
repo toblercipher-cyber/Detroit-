@@ -177,7 +177,10 @@ def _spy(deps, **kw):
     _caught["deps"] = deps
     return _orig(deps, **kw)
 _m.build_workflow = _spy
-_m.build_project_service(_gs())
+from langgraph.checkpoint.memory import InMemorySaver
+from backend.memory.artifacts import JsonArtifactRepository
+_m.build_project_service(_gs(), InMemorySaver(),
+                         JsonArtifactRepository(_gs().builder_data_dir))
 _m.build_workflow = _orig
 _d = _caught["deps"]
 print("   preview_capture is capture_preview:", ok(_d.preview_capture is _cp))

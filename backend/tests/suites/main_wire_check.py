@@ -13,6 +13,7 @@ os.environ["BUILDER_DATA_DIR"] = tempfile.mkdtemp(prefix="detroit_test_var_")
 
 import backend.main as m
 from backend.config.settings import get_settings
+from backend.memory.artifacts import JsonArtifactRepository
 from backend.graph.workflow import WorkflowDependencies
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -31,13 +32,17 @@ print("   none missing:", ok(fields == supplied))
 
 print()
 print("=== 3. Service builds end to end ===")
-svc = m.build_project_service(get_settings())
+_injected = InMemorySaver()
+svc = m.build_project_service(get_settings(), _injected,
+                              JsonArtifactRepository(get_settings().builder_data_dir))
 print("   ProjectService built :", ok(type(svc).__name__ == "ProjectService"))
 
 print()
-print("=== 4. Checkpointer is InMemorySaver, not None ===")
+print("=== 4. The INJECTED checkpointer is the one the graph uses ===")
 cp = svc._workflow.checkpointer
 print("   type :", type(cp).__name__, ok(isinstance(cp, InMemorySaver)))
+print("   is the injected instance :", ok(cp is _injected))
+print("   not None (gates unanswerable):", ok(cp is not None))
 
 print()
 print("=== 5. Per-role policy is NOT flattened across agents ===")

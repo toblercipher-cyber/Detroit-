@@ -68,6 +68,7 @@ import asyncio
 import base64
 import contextlib
 import logging
+import sys
 import threading
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
@@ -203,6 +204,60 @@ def capture_viewports(
         ).result()
 
 
+# Serialises the policy swap below. The window is tiny, but it mutates global
+# interpreter state, so two concurrent captures must not interleave it.
+_POLICY_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _subprocess_capable_event_loop() -> Iterator[None]:
+    """Make Playwright able to start a browser on Windows.
+
+    THE CONFLICT THIS RESOLVES
+        On Windows the two halves of this backend want opposite event loops,
+        and only one policy exists per interpreter:
+
+          - async psycopg REFUSES ``ProactorEventLoop`` -- it needs
+            ``add_reader``/``add_writer``, which that loop does not provide. The
+            durable checkpointer therefore requires ``SelectorEventLoop``, which
+            ``backend/main.py`` selects at import (docs/state.md 5.0.2).
+          - Playwright launches Chromium as a SUBPROCESS, and
+            ``SelectorEventLoop`` raises ``NotImplementedError`` from
+            ``_make_subprocess_transport``. Only ``ProactorEventLoop`` supports
+            subprocesses on Windows.
+
+        Wiring the Postgres checkpointer therefore broke the preview capture --
+        and because that capture feeds the MANDATORY quality gate, the failure
+        mode was a gate blocked by an unrelated database change
+        (CLAUDE.md 15).
+
+    WHY A SWAP AND NOT A REDESIGN
+        Playwright's sync API builds its own loop with
+        ``asyncio.new_event_loop()``, which consults the global policy -- so
+        setting a loop on this thread is not enough; the policy itself has to
+        change for the duration. Swapping it here is contained: it happens on a
+        worker thread, around one call, and the main loop already exists and is
+        unaffected (a policy governs loop CREATION, not running loops).
+
+        The durable fix is to run the capture in its own process, which removes
+        the shared-interpreter constraint entirely. That is a larger change than
+        this one deserves to carry.
+
+    A no-op on every platform except Windows.
+    """
+    if sys.platform != "win32":
+        yield
+        return
+
+    with _POLICY_LOCK:
+        previous = asyncio.get_event_loop_policy()
+        asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+        try:
+            yield
+        finally:
+            asyncio.set_event_loop_policy(previous)
+
+
 def _capture_viewports_sync(
     dist_dir: Path,
     url: str = "",
@@ -236,7 +291,11 @@ def _capture_viewports_sync(
 
     captured: dict[str, RenderedPreviewPayload] = {}
     try:
-        with _serve(index.parent) as origin, sync_playwright() as playwright:
+        with (
+            _subprocess_capable_event_loop(),
+            _serve(index.parent) as origin,
+            sync_playwright() as playwright,
+        ):
             page_url = origin + index.name
             # The payload records where a human can see this, falling back to
             # where it was actually rendered. Never empty: the payload model

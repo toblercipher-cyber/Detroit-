@@ -236,6 +236,9 @@ print()
 print("=== 9. Upload route over HTTP ===")
 from backend.main import create_app
 client = TestClient(create_app(), raise_server_exceptions=False)
+# Routes now require a verified caller; stub identity only.
+from backend.tests.suites._auth_stub import authenticate
+authenticate(client.app)
 client.__enter__()
 svc2 = build()
 client.app.state.project_service = svc2
