@@ -30,6 +30,7 @@ from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
 from backend.agents.frontend_architect import FrontendArchitectAgent as _FAA
 from backend.memory.artifacts import JsonArtifactRepository as _JAR
 from backend.schemas.state import ReferenceAnalysis as _RA
+from backend.tests.suites import _tmpdir
 
 
 class _RefStub(_R):
@@ -78,7 +79,7 @@ def _ref_deps():
                 max_auto_iterations=3,
                 # Blocked, which is the real state of this repository.
                 impeccable_probe=lambda: _IS(False, reason="not installed"),
-                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+                repository=_JAR(_P(_tmpdir.mkdtemp(prefix="wfdeps_"))))
 
 
 N = {"d": 0}
@@ -113,7 +114,7 @@ def make_client():
         requirement_analyzer=RequirementAnalyzerAgent(FakeChat()),
         planner=PlannerAgent(FakeChat()),
         design_director=DesignDirectorAgent(FakeChat())), checkpointer=InMemorySaver())
-    svc = ProjectService(repository=JsonArtifactRepository(Path(tempfile.mkdtemp())),
+    svc = ProjectService(repository=JsonArtifactRepository(Path(_tmpdir.mkdtemp())),
                          workflow=g, settings=get_settings())
     from backend.main import create_app
     client = TestClient(create_app(), raise_server_exceptions=False)

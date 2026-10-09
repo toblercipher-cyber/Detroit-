@@ -12,6 +12,7 @@ from backend.memory.artifacts import (JsonArtifactRepository,
                                       InvalidProjectIdError, ProjectNotFoundError)
 from backend.config.settings import get_settings
 from backend.schemas.api import ErrorCode
+from backend.tests.suites import _tmpdir
 
 PNG = b"\x89PNG\r\n\x1a\n" + b"pixels" * 20
 JPEG = b"\xff\xd8\xff\xe0" + b"jpegdata" * 20
@@ -22,7 +23,7 @@ HTML = b"<!doctype html><script>fetch('/steal')</script>"
 
 
 def fresh():
-    repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="upl_")))
+    repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="upl_")))
     svc = ProjectService(repository=repo, workflow=object(), settings=get_settings())
     return svc, svc.create(prompt="coffee shop").project_id
 

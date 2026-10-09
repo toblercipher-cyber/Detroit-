@@ -110,7 +110,8 @@ def ready_state(repo):
 
 
 print("=== 1. Happy path: model writes, real toolchain compiles ===")
-repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_ok_")))
+from backend.tests.suites import _tmpdir
+repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="bn_ok_")))
 st = ready_state(repo)
 chat = make_chat(GOOD_APP)
 out = asyncio.run(build_node(st, deps_for(chat, repo)))
@@ -165,7 +166,7 @@ print("   tampered config restored:",
 
 print()
 print("=== 6. A type error fails the stage and is recorded, not raised ===")
-repo2 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_bad_")))
+repo2 = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="bn_bad_")))
 stb = ready_state(repo2)
 outb = asyncio.run(build_node(stb, deps_for(make_chat(BAD_APP), repo2)))
 print("   run_status FAILED :", outb["run_status"].value,
@@ -181,7 +182,7 @@ print("   last_error set    :", ok(outb.get("last_error") is not None))
 
 print()
 print("=== 7. Manifest helper ignores everything it should ===")
-w = Path(tempfile.mkdtemp(prefix="bn_man_"))
+w = Path(_tmpdir.mkdtemp(prefix="bn_man_"))
 (w / "src" / "nested").mkdir(parents=True)
 (w / "src" / "a.tsx").write_text("a", encoding="utf-8")
 (w / "src" / "nested" / "b.css").write_text("bb", encoding="utf-8")
@@ -191,7 +192,7 @@ w = Path(tempfile.mkdtemp(prefix="bn_man_"))
 m = sorted(f.path for f in _workspace_manifest(w))
 print("   manifest:", m, ok(m == ["src/a.tsx", "src/nested/b.css"]))
 print("   posix separators:", ok(all("\\\\" not in p for p in m)))
-print("   empty workspace -> []:", ok(_workspace_manifest(Path(tempfile.mkdtemp())) == []))
+print("   empty workspace -> []:", ok(_workspace_manifest(Path(_tmpdir.mkdtemp())) == []))
 
 print()
 print("=== 8. Preview node: publishes the built output ===")
@@ -216,7 +217,7 @@ print("   last_error cleared:", ok(pv["last_error"] is None))
 print()
 print("=== 9. Preview refuses when there is no build output ===")
 import shutil as _sh
-repo3 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="bn_nopv_")))
+repo3 = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="bn_nopv_")))
 st3 = ready_state(repo3)
 pv2 = preview_node(st3, deps_for(make_chat(GOOD_APP), repo3))
 print("   no dist -> FAILED:", pv2["run_status"].value,

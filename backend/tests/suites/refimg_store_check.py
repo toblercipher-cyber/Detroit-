@@ -10,8 +10,9 @@ from backend.memory.artifacts import (JsonArtifactRepository, StateRepository,
                                       ProjectNotFoundError, InvalidProjectIdError,
                                       StateRepositoryError)
 from backend.schemas.state import ProjectState
+from backend.tests.suites import _tmpdir
 
-root = Path(tempfile.mkdtemp(prefix="refimg_"))
+root = Path(_tmpdir.mkdtemp(prefix="refimg_"))
 repo = JsonArtifactRepository(root)
 st = ProjectState(user_request="coffee shop")
 repo.save(st)

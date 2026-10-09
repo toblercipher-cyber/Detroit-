@@ -28,6 +28,7 @@ from backend.schemas.state import (ProjectState, ReviewFindings, EvaluationFindi
                                    PreviewStatus, FileRef, EvaluationReport)
 from backend.context.builder import RenderedPreviewPayload
 import base64
+from backend.tests.suites import _tmpdir
 
 # PNG magic bytes, built without escapes so no shell layer can mangle them.
 SHOT = base64.b64encode(bytes([137, 80, 78, 71, 13, 10, 26, 10]) + b'p' * 400).decode()
@@ -67,7 +68,7 @@ class Stub(Runnable):
 
 def make_deps(probe, detector=None, severity=Severity.MINOR, boom=False,
               repo=None, capture=fake_capture):
-    repo = repo or JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="ev_")))
+    repo = repo or JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="ev_")))
     st = Stub(severity, boom)
     return WorkflowDependencies(
         context_builder=ContextBuilder(),
@@ -111,12 +112,12 @@ print("=== 2. Availability is the CLI, NOT the .impeccable/ directory ===")
 # its absence meant "not installed". That conflated optional per-project
 # detector config with tool installation, and would have blocked the gate
 # forever on a machine where the tool works. These assertions pin the fix.
-repo_without = Path(tempfile.mkdtemp(prefix="noimpdir_"))
+repo_without = Path(_tmpdir.mkdtemp(prefix="noimpdir_"))
 print("   no .impeccable/ in that dir :", ok(not (repo_without / ".impeccable").is_dir()))
 print("   probe STILL available       :", ok(probe_impeccable(repo_without).available),
       "(the old probe said blocked here)")
 
-repo_with = Path(tempfile.mkdtemp(prefix="withimpdir_"))
+repo_with = Path(_tmpdir.mkdtemp(prefix="withimpdir_"))
 (repo_with / ".impeccable").mkdir()
 print("   adding .impeccable/ changes nothing:",
       ok(probe_impeccable(repo_with).available == probe_impeccable(repo_without).available))

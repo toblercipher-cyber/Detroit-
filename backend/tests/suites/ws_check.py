@@ -4,10 +4,11 @@ from pathlib import Path
 sys.path.insert(0, os.getcwd()); sys.dont_write_bytecode = True
 from backend.tools.workspace import (WorkspaceFiles, WorkspaceAccessError,
                                      build_workspace_tools)
+from backend.tests.suites import _tmpdir
 
 ok = lambda b: "PASS" if b else "**FAIL**"
-root = Path(tempfile.mkdtemp(prefix="ws-test-"))
-outside = Path(tempfile.mkdtemp(prefix="ws-outside-"))
+root = Path(_tmpdir.mkdtemp(prefix="ws-test-"))
+outside = Path(_tmpdir.mkdtemp(prefix="ws-outside-"))
 try:
     # lay down a template exactly as docs/architecture.md 5.1 describes
     (root / "src" / "components").mkdir(parents=True)

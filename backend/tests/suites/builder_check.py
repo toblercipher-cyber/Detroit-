@@ -9,6 +9,7 @@ from backend.context.builder import ContextBuilder, ChangedFilePayload
 from backend.schemas.enums import AgentRole
 from backend.schemas.state import ProjectState, Plan, DesignSpec, ComponentTree, ComponentNode, BuildResult
 from backend.tools.workspace import WorkspaceFiles
+from backend.tests.suites import _tmpdir
 
 ok = lambda b: "PASS" if b else "**FAIL**"
 
@@ -27,7 +28,7 @@ def call(name, args, cid):
     return {"name": name, "args": args, "id": cid, "type": "tool_call"}
 
 
-root = Path(tempfile.mkdtemp(prefix="builder-ws-"))
+root = Path(_tmpdir.mkdtemp(prefix="builder-ws-"))
 try:
     (root / "src").mkdir()
     (root / "package.json").write_text('{"name":"t"}', encoding="utf-8")

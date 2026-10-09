@@ -38,7 +38,8 @@ print("=== 5. Round trip through storage with a generated id ===")
 import tempfile
 from pathlib import Path
 from backend.schemas.state import ProjectState
-repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="imgid_")))
+from backend.tests.suites import _tmpdir
+repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="imgid_")))
 st = ProjectState(user_request="x"); repo.save(st)
 iid = new_image_id()
 repo.save_reference_image(st.project_id, iid, b"\x89PNG\r\n\x1a\nbytes", "image/png")

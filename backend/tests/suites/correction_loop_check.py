@@ -151,7 +151,8 @@ def fixable_state(repo):
 
 print()
 print("=== 4. Targeted Fix: writes, counts, re-reads from disk ===")
-repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="cl_")))
+from backend.tests.suites import _tmpdir
+repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="cl_")))
 st = fixable_state(repo)
 out = asyncio.run(targeted_fix_node(st, make_deps(FixStub(), repo)))
 print("   stage TARGETED_FIX :", ok(out["current_stage"] is WorkflowStage.TARGETED_FIX))
@@ -164,7 +165,7 @@ print("   manifest re-read from disk:",
 
 print()
 print("=== 5. A FAILED fix still consumes an attempt ===")
-repo2 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="cl2_")))
+repo2 = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="cl2_")))
 st2 = fixable_state(repo2)
 st2.iteration_count = 1
 out2 = asyncio.run(targeted_fix_node(st2, make_deps(FixStub(fail=True), repo2)))
@@ -174,7 +175,7 @@ print("   -> a failing fixer cannot loop forever")
 
 print()
 print("=== 6. Fix with no findings refuses rather than inventing work ===")
-repo3 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="cl3_")))
+repo3 = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="cl3_")))
 st3 = fixable_state(repo3)
 st3.evaluation_results = report("failed", [])
 out3 = asyncio.run(targeted_fix_node(st3, make_deps(FixStub(), repo3)))
@@ -183,7 +184,7 @@ print("   no iteration spent :", ok("iteration_count" not in out3))
 
 print()
 print("=== 7. Re-evaluation is the SAME gate under a different stage ===")
-repo4 = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="cl4_")))
+repo4 = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="cl4_")))
 st4 = fixable_state(repo4)
 st4.preview_status = PreviewStatus(preview_url="/preview/p/", status="fresh")
 deps4 = make_deps(FixStub(), repo4)

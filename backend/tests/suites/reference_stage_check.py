@@ -80,12 +80,13 @@ class FakeChat(Runnable):
                     SEEN["prompt"] = i.to_messages() if hasattr(i, "to_messages") else i
                 return make()
         return _S()
+from backend.tests.suites import _tmpdir
 
 
 def build(tmp=None):
     N["ref"] = 0
     SEEN["prompt"] = None
-    repo = JsonArtifactRepository(Path(tmp or tempfile.mkdtemp(prefix="refstage_")))
+    repo = JsonArtifactRepository(Path(tmp or _tmpdir.mkdtemp(prefix="refstage_")))
     g = build_workflow(WorkflowDependencies(
         context_builder=ContextBuilder(),
         requirement_analyzer=RequirementAnalyzerAgent(FakeChat()),
@@ -308,7 +309,7 @@ class ArchChat(FakeChat):
 
 
 def build_arch():
-    repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="arch_")))
+    repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="arch_")))
     g = build_workflow(WorkflowDependencies(
         context_builder=ContextBuilder(),
         requirement_analyzer=RequirementAnalyzerAgent(ArchChat()),

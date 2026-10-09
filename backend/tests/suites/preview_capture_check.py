@@ -16,9 +16,10 @@ from backend.tools.preview_capture import (capture_preview, capture_viewports,
 from backend.tools.template import scaffold_workspace
 from backend.tools.build_runner import BuildRunner
 from backend.context.builder import RenderedPreviewPayload
+from backend.tests.suites import _tmpdir
 
 print("=== 1. Entry point containment ===")
-empty = Path(tempfile.mkdtemp(prefix="pc_empty_"))
+empty = Path(_tmpdir.mkdtemp(prefix="pc_empty_"))
 try:
     _index_path(empty)
     print("   missing index.html accepted **FAIL**")
@@ -28,7 +29,7 @@ except PreviewCaptureError as e:
 
 print()
 print("=== 2. Build a REAL project to render ===")
-ws = Path(tempfile.mkdtemp(prefix="pc_ws_"))
+ws = Path(_tmpdir.mkdtemp(prefix="pc_ws_"))
 scaffold_workspace(ws)
 # Content that only exists AFTER React runs. If the capture sees this, it
 # captured the rendered DOM; if it sees only <div id="root">, it did not.
@@ -238,7 +239,7 @@ class RevStub(Runnable):
     "}\n", encoding="utf-8")
 assert BuildRunner(timeout_seconds=600).run(ws).ok
 
-repo = JsonArtifactRepository(Path(tempfile.mkdtemp(prefix="pc_eval_")))
+repo = JsonArtifactRepository(Path(_tmpdir.mkdtemp(prefix="pc_eval_")))
 st = ProjectState(user_request="coffee shop")
 st.preview_status = PreviewStatus(preview_url="/preview/p/", status="fresh")
 st.generated_files = [FileRef(path="src/App.tsx", size_bytes=1, sha256="a")]

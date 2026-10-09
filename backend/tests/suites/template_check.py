@@ -9,6 +9,7 @@ from backend.tools.template import (ALLOWED_DEPENDENCIES, ALLOWED_DEV_DEPENDENCI
                                     BUILDER_OWNED_FILES, SEED_SOURCE_FILES,
                                     scaffold_workspace)
 from backend.tools.workspace import WorkspaceFiles, WorkspaceAccessError, PROTECTED_NAMES
+from backend.tests.suites import _tmpdir
 
 print("=== 1. package.json is generated FROM the allowlist ===")
 pkg = json.loads(BUILDER_OWNED_FILES["package.json"])
@@ -42,7 +43,7 @@ for name in executed:
 
 print()
 print("=== 5. The write tool refuses every builder-owned file ===")
-tmp = Path(tempfile.mkdtemp(prefix="tmpl_"))
+tmp = Path(_tmpdir.mkdtemp(prefix="tmpl_"))
 scaffold_workspace(tmp)
 wf = WorkspaceFiles(tmp)
 gaps = []
@@ -62,7 +63,7 @@ for rel in SEED_SOURCE_FILES:
 
 print()
 print("=== 6. Scaffold is idempotent; builder-owned wins, sources survive ===")
-tmp2 = Path(tempfile.mkdtemp(prefix="tmpl2_"))
+tmp2 = Path(_tmpdir.mkdtemp(prefix="tmpl2_"))
 scaffold_workspace(tmp2)
 (tmp2 / "src" / "App.tsx").write_text("export default () => <p>MINE</p>;\n", encoding="utf-8")
 (tmp2 / "vite.config.ts").write_text("// tampered\n", encoding="utf-8")

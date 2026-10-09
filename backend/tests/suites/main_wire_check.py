@@ -9,7 +9,8 @@ os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
 # A throwaway data dir per run. Never the repository's own var/: a test must not
 # be able to read or overwrite real project artifacts.
 import tempfile
-os.environ["BUILDER_DATA_DIR"] = tempfile.mkdtemp(prefix="detroit_test_var_")
+from backend.tests.suites import _tmpdir
+os.environ["BUILDER_DATA_DIR"] = _tmpdir.mkdtemp(prefix="detroit_test_var_")
 
 import backend.main as m
 from backend.config.settings import get_settings

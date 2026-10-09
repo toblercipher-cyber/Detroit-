@@ -10,6 +10,7 @@ from backend.schemas.enums import AgentRole, Severity, WorkflowStage
 from backend.schemas.state import (ProjectState, ApprovedDecision, EvaluationFinding,
                                    FixResult)
 from backend.tools.workspace import WorkspaceFiles
+from backend.tests.suites import _tmpdir
 
 ok = lambda b: "PASS" if b else "**FAIL**"
 
@@ -39,7 +40,7 @@ def call(path, content, cid, name="write_workspace_file"):
     return {"name": name, "args": {"path": path, "content": content}, "id": cid, "type": "tool_call"}
 
 
-root = Path(tempfile.mkdtemp(prefix="fixer-ws-"))
+root = Path(_tmpdir.mkdtemp(prefix="fixer-ws-"))
 try:
     (root / "src").mkdir()
     (root / "src" / "Hero.tsx").write_text("old hero", encoding="utf-8")

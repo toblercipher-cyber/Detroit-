@@ -15,6 +15,7 @@ from backend.tools.build_runner import (BuildRunner, BUILD_STEPS, MAX_OUTPUT_CHA
                                         sanitize_output, _subprocess_env,
                                         _resolve_launcher)
 from backend.tools.template import scaffold_workspace
+from backend.tests.suites import _tmpdir
 
 print("=== 1. Only allowlisted commands exist, as argument LISTS ===")
 names = [n for n, _ in BUILD_STEPS]
@@ -77,7 +78,7 @@ print("   empty stays empty      :", ok(sanitize_output("", ws) == ""))
 
 print()
 print("=== 4. Refuses an unscaffolded workspace before spawning anything ===")
-empty = Path(tempfile.mkdtemp(prefix="br_empty_"))
+empty = Path(_tmpdir.mkdtemp(prefix="br_empty_"))
 r = BuildRunner(timeout_seconds=60).run(empty)
 print("   ok False        :", ok(not r.ok))
 print("   failed_step     :", r.failed_step, ok(r.failed_step == "scaffold"))
@@ -86,7 +87,7 @@ print("   message is safe :", repr(r.message), ok(os.sep not in r.message))
 
 print()
 print("=== 5. REAL BUILD of a scaffolded workspace ===")
-ws1 = Path(tempfile.mkdtemp(prefix="br_good_"))
+ws1 = Path(_tmpdir.mkdtemp(prefix="br_good_"))
 scaffold_workspace(ws1)
 start = time.time()
 r1 = BuildRunner(timeout_seconds=600).run(ws1)
@@ -150,7 +151,7 @@ print("   message names build:", repr(r3.message), ok("build" in r3.message))
 
 print()
 print("=== 8. Timeout is bounded and reported, not hung ===")
-ws2 = Path(tempfile.mkdtemp(prefix="br_slow_"))
+ws2 = Path(_tmpdir.mkdtemp(prefix="br_slow_"))
 scaffold_workspace(ws2)
 start = time.time()
 r4 = BuildRunner(timeout_seconds=1).run(ws2)   # npm install cannot finish in 1s

@@ -14,8 +14,9 @@ from backend.memory.artifacts import JsonArtifactRepository
 from backend.services.projects import ProjectService
 from backend.config.settings import get_settings
 from backend.schemas.state import ProjectState
+from backend.tests.suites import _tmpdir
 
-root = Path(tempfile.mkdtemp(prefix="pv_"))
+root = Path(_tmpdir.mkdtemp(prefix="pv_"))
 repo = JsonArtifactRepository(root)
 svc = ProjectService(repository=repo, workflow=object(), settings=get_settings())
 st = svc.create(prompt="coffee shop")

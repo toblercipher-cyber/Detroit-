@@ -8,6 +8,7 @@ from backend.schemas.enums import AgentRole, Severity, WorkflowStage, HitlAction
 from backend.schemas.api import ProjectStateResponse, HitlDecisionRequest
 from backend.context.builder import ContextBuilder, ContextPermissionError
 from backend.memory.artifacts import JsonArtifactRepository
+from backend.tests.suites import _tmpdir
 
 ok = lambda b: "PASS" if b else "**FAIL**"
 
@@ -91,7 +92,7 @@ for kw, should_pass, label in cases:
 
 print()
 print("=== G. Repository round-trip (temp dir) ===")
-tmp = tempfile.mkdtemp(prefix="repo-test-")
+tmp = _tmpdir.mkdtemp(prefix="repo-test-")
 try:
     repo = JsonArtifactRepository(__import__("pathlib").Path(tmp))
     repo.save(s)

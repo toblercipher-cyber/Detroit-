@@ -29,6 +29,7 @@ from backend.agents.reference_analyzer import ReferenceAnalyzerAgent as _RAA
 from backend.agents.frontend_architect import FrontendArchitectAgent as _FAA
 from backend.memory.artifacts import JsonArtifactRepository as _JAR
 from backend.schemas.state import ReferenceAnalysis as _RA
+from backend.tests.suites import _tmpdir
 
 
 class _RefStub(_R):
@@ -77,7 +78,7 @@ def _ref_deps():
                 max_auto_iterations=3,
                 # Blocked, which is the real state of this repository.
                 impeccable_probe=lambda: _IS(False, reason="not installed"),
-                repository=_JAR(_P(_tf.mkdtemp(prefix="wfdeps_"))))
+                repository=_JAR(_P(_tmpdir.mkdtemp(prefix="wfdeps_"))))
 
 
 
@@ -104,7 +105,7 @@ def fresh_service(tmp):
                           workflow=g, settings=get_settings())
 
 
-tmp = tempfile.mkdtemp(prefix="svc_check_")
+tmp = _tmpdir.mkdtemp(prefix="svc_check_")
 svc = fresh_service(tmp)
 
 print("=== 1. A paused run no longer raises ===")
@@ -155,7 +156,7 @@ print("   both approvals kept:", len(s3.approved_decisions), ok(len(s3.approved_
 
 print()
 print("=== 5. A FAILED run keeps FAILED (malformed decision) ===")
-svc2 = fresh_service(tempfile.mkdtemp(prefix="svc_check2_"))
+svc2 = fresh_service(_tmpdir.mkdtemp(prefix="svc_check2_"))
 p2 = svc2.create(prompt="x").project_id
 o2 = asyncio.run(svc2.run_workflow(p2))
 cfgb = {"configurable": {"thread_id": p2}}
