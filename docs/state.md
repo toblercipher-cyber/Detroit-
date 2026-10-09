@@ -127,31 +127,79 @@ targets **re-runs in place** rather than advancing (`docs/workflow.md` §3).
 ### 5.0 Target store: Supabase / PostgreSQL
 
 **Decided:** the project's database is **Supabase / PostgreSQL**
-(`docs/architecture.md` §3.8).
+(`docs/architecture.md` §3.8), and the architecture is multi-user with
+Supabase Auth and RLS (`docs/database.md` — the authority).
 
-**Undecided, and deliberately left so:** schema, tables, columns, migrations and
-access patterns, until the user explicitly defines them.
+**The schema is no longer undecided.** `docs/database.md` §3 designs it. This
+section previously said "do not design a schema in advance"; that instruction
+is spent, and keeping it would now block the work it was protecting.
 
-Because the schema is undecided, **no database code, driver, client, ORM or migration
-is written now**. Instead:
+**Status, verified 2026-10-09:**
+
+| | |
+|---|---|
+| Connection to Supabase PostgreSQL | **live** — PG 17.11, authenticated query succeeded |
+| `DATABASE_URL` in settings, as `SecretStr` | **done** |
+| `psycopg` 3.3.6, `langgraph-checkpoint-postgres` 3.1.2 | installed **and declared** in `requirements.txt` |
+| Postgres `StateRepository` | **written** — `backend/memory/postgres.py`, owner-scoped |
+| Postgres checkpointer | **live** — durable across restarts, verified |
+| Tables, migrations, RLS | **applied** — migrations 0001 and 0002 |
+
+The interface rule is unchanged and still load-bearing:
 
 - Persistence lives behind a narrow interface in `backend/memory/`.
 - The graph and the API depend on that interface, never on a concrete store.
-- When the schema is defined, Postgres is wired in behind the same interface — the
-  checkpointer moves to the Postgres saver and artifacts move to tables — without
-  reworking the graph, the agents or the API contract.
+- Postgres arrives as a **second implementation** behind it — the checkpointer
+  moves to the Postgres saver and artifacts move to tables — without reworking
+  the graph, the agents or the API contract.
 
-Do not design a schema in advance, and do not assume table shapes.
+#### 5.0.1 One thing multi-user does change here — OPEN
 
-### 5.1 Interim layers (until the schema is defined)
+Owner-scoped listing means the caller's identity has to reach the query.
+`ProjectState` has no owner field and the `StateRepository` methods take no
+caller. Either:
+
+- `ProjectState` gains an owner, which makes it part of the state the graph
+  carries; or
+- identity is passed beside it as a caller argument, which changes the
+  Protocol's signatures.
+
+**DECIDED 2026-10-09: neither.** `ProjectState` gains no owner — it is the
+LangGraph graph state, so an owner there would be serialized into every
+checkpoint and reach agent context slices (`CLAUDE.md` §8). And the Protocol's
+eight signatures are unchanged, because the owner binds to a *scoped
+repository view* (`OwnerScopedRepository`) and a *scoped service*
+(`ProjectService.for_owner`) instead of becoming a parameter on eighteen call
+sites. A route that forgets to scope raises `TypeError` rather than leaking.
+
+#### 5.0.2 A Windows constraint worth recording
+
+Async psycopg refuses to run on Windows' default `ProactorEventLoop`:
+
+> `Psycopg cannot use the 'ProactorEventLoop' to run in async mode.`
+
+uvicorn on Windows selects that loop by default, so the composition root must
+set `WindowsSelectorEventLoopPolicy` or the async checkpointer fails at
+runtime. Verified: the same connection succeeds under the selector loop.
+
+### 5.1 Interim layers (still in force today)
 
 | Layer | What | Where | Purpose |
 |---|---|---|---|
 | **Checkpointer** | LangGraph graph checkpoints, including pending interrupts | `InMemorySaver` — **process memory, not disk** | correctness — lets an interrupted run resume exactly where it paused, for as long as the process lives |
 | **Artifacts** | Human-readable structured state | `var/projects/{project_id}/*.json` | auditability — inspectable, diffable, matches `CLAUDE.md` §9 |
 
-Both are interim and migrate to Supabase/PostgreSQL once the schema exists. The
-interface they sit behind does not change.
+**Both are still what runs.** The database is connected and the schema is
+designed, but no Postgres repository or Postgres checkpointer has been written,
+so these two remain the live implementation — see §5.0 for exactly how far the
+migration has got, and §5.0.1 for the decision that blocks the next step.
+
+Of the two, only the **artifacts** are superseded outright by
+`docs/database.md` §5 #1, which keeps them as the local export/review
+representation rather than deleting them. The checkpointer is a straight
+replacement by LangGraph's Postgres saver.
+
+The interface they sit behind does not change.
 
 Artifact files, written after each stage completes:
 

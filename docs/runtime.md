@@ -35,24 +35,37 @@ change any code.
 | `pydantic-settings` | typed configuration from environment |
 | `python-multipart` | reference-image uploads |
 | `langgraph` | workflow graph, interrupts, checkpointing |
-| *(checkpointer package)* | **undecided** — see §2.1 |
 | `langchain-core` | prompts, structured output, runnables |
 | `langchain-anthropic` | Claude provider binding |
 | `sse-starlette` | SSE event stream |
 | `httpx` | outbound HTTP where needed |
+| `playwright` | headless Chromium for rendered-preview capture (plus a non-pip `playwright install chromium` step) |
+| `mcp` | MCP server discovery |
+| `pytest` | the verification suites |
 
-Deliberately **not** included in v1: any second model provider, any vector store, any
-document loader, any ORM. RAG is deferred (`CLAUDE.md` §22).
+**Approved, needed for the database, NOT YET DECLARED:**
 
-Every package above needs explicit approval before installation. Versions will be
-pinned in the manifest when it is created.
+| Package | Why | Status |
+|---|---|---|
+| `psycopg[binary,pool]` | async PostgreSQL driver. Chosen over `asyncpg` because `langgraph-checkpoint-postgres` uses psycopg v3, and two drivers for one database is two connection stories | **3.3.6 installed in `.venv`** during connection verification; deliberately **not in `requirements.txt`** until the persistence file is approved |
+| `langgraph-checkpoint-postgres` | the durable checkpointer that replaces `InMemorySaver` | not installed |
+
+Deliberately **not** included: any second model provider, any vector store, any
+document loader, **any ORM**. The `StateRepository` Protocol plus psycopg is the
+whole persistence stack; SQLAlchemy would add a second schema definition to keep
+in sync with the Pydantic models. RAG is deferred (`CLAUDE.md` §22).
+
+Every package above needs explicit approval before installation.
 
 ### 2.1 Deferred dependencies — do NOT add speculatively
 
 | Dependency | Status | Unblocked by |
 |---|---|---|
-| Supabase client / Postgres driver / migration tool | **deferred** | the user defining the database schema (`docs/architecture.md` §3.8) |
-| Checkpointer package | **undecided** | choosing the interim checkpointer (`docs/state.md` §5.1) |
+| Postgres driver (`psycopg`) | **UNBLOCKED** — schema designed, connection verified. Installed in `.venv`, pending declaration | approval of the persistence file that uses it |
+| `langgraph-checkpoint-postgres` | **UNBLOCKED** — the durable checkpointer is decided (`docs/database.md` §1.2) | the same approval |
+| Supabase **client** library | **still deferred, and may never be needed.** v1 reaches Postgres directly; Supabase Auth is verified by JWT, not by a client SDK (`docs/database.md` §1.3.5) | a requirement that needs PostgREST, Storage or the Auth admin API |
+| Migration tool | **not chosen.** Alembic is ORM-adjacent; plain SQL files are the likely answer | the schema-revision step (`docs/database.md` §3.0) |
+| ORM / SQLAlchemy | **not permitted.** See above | an explicit reversal |
 | Impeccable | **required and installed** (skill 4.3.1, CLI 4.0.0) | — nothing to add; it is not a Python dependency (`docs/design.md` §5.2) |
 | Zapier client / webhook tooling | **deferred** | the user enabling the automation layer (`docs/architecture.md` §3.9) |
 | Anything else | not in the documented architecture | an explicit decision |
@@ -65,27 +78,23 @@ Configuration comes from environment variables, loaded through a single
 `pydantic-settings` object in `backend/config/`. No module reads `os.environ`
 directly.
 
-### 3.1 Required `.gitignore` change (pre-implementation)
+### 3.1 `.gitignore` — DONE
 
-The repository's `.gitignore` currently lists `node_modules`, `dist`, `dist-ssr`,
-`*.local`, `.impeccable/mocks`, `.impeccable/config.local.json`, `*.tsbuildinfo`,
-`.venv`, `Refrence_images`.
+Both required entries are in place, verified 2026-10-09:
 
-It does **not** ignore `.env`. Before any backend file is created, add:
+| Entry | Line | Why |
+|---|---|---|
+| `.env` | 27 | prevents committing secrets (`docs/security.md` §2) |
+| `var/` | 32 | runtime data: checkpoints, project artifacts, generated workspaces, uploaded references |
 
-```text
-.env
-var/
-```
+**One trap this leaves.** The pattern `.env` matches that filename exactly. A
+sibling — `.env.bak`, `.env.local`, `.env.production` — is **not** ignored and
+would be committed. Never leave a copy of `.env` beside it; put backups outside
+the repository.
 
-- `.env` — prevents committing secrets (`docs/security.md` §2).
-- `var/` — runtime data: checkpointer database, project artifacts, generated
-  workspaces, uploaded references.
-
-Separately, `Refrence_images` is currently ignored, which means the approved Chatbot
-reference is untracked and absent from a fresh clone. The Reference Analysis stage
-depends on it. Recommended: stop ignoring at least
-`Refrence_images/chatbot_refrence.png`. This is a user decision.
+`Refrence_images` is **no longer ignored**, so the approved Chatbot reference is
+tracked and present in a fresh clone. The earlier recommendation here is
+resolved.
 
 ### 3.2 Variables
 
@@ -96,7 +105,7 @@ depends on it. Recommended: stop ignoring at least
 | `ANTHROPIC_MODEL_HEAVY` | no | `claude-opus-5` | optional model for heavy-reasoning roles |
 | `APP_ENV` | no | `development` | `development` \| `production` |
 | `LOG_LEVEL` | no | `INFO` | logging verbosity |
-| `API_HOST` | no | `127.0.0.1` | **must stay loopback while there is no auth** |
+| `API_HOST` | no | `127.0.0.1` | **must stay loopback until auth is implemented** (`docs/api.md` §1.1) |
 | `API_PORT` | no | `8000` | API port |
 | `ALLOWED_ORIGINS` | no | `http://localhost:5173` | CORS allowlist |
 | `BUILDER_DATA_DIR` | no | `./var` | root for checkpoints, artifacts, workspaces |
@@ -108,10 +117,41 @@ depends on it. Recommended: stop ignoring at least
 | `ENABLE_PROMPT_CACHING` | no | `false` | see §5 |
 | `MCP_GITHUB_ENABLED` | no | `false` | GitHub MCP connection |
 
-**Database (deferred — do not add until the schema is defined):** Supabase/Postgres
-connection variables are intentionally absent. They are added when the user defines
-the schema (`docs/architecture.md` §3.8). Whatever they turn out to be, the
-connection string and service key are **secrets** and follow §3.4.
+### 3.2.1 Database & Supabase variables
+
+No longer deferred. All five are present in `.env` and declared in
+`backend/config/settings.py`.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `DATABASE_URL` | no* | — | libpq URI for Supabase PostgreSQL, used by the durable repository and the LangGraph checkpointer. **SECRET** — the password is embedded |
+| `SUPABASE_URL` | no | — | project API URL. Not a secret. **Unused by v1 backend** |
+| `SUPABASE_PUBLISHABLE_KEY` | no | — | anon key. Safe in a browser **only because RLS is enabled**. Unused by v1 backend |
+| `SUPABASE_SERVICE_ROLE_KEY` | no | — | **SECRET, bypasses RLS entirely.** Read by nothing today |
+| `SUPABASE_DB_PASSWORD` | no | — | **SECRET.** Already embedded in `DATABASE_URL`; never read separately |
+
+\* Optional **on purpose**. Without it the backend keeps running on the
+filesystem repository and `InMemorySaver`, and logs a startup warning that
+pending HITL gates will not survive a restart. Making it required would turn a
+half-finished migration into a backend that refuses to boot.
+
+Validation applied to `DATABASE_URL` when present: the scheme must be
+`postgresql://` or `postgres://` (a `+driver` suffix is SQLAlchemy syntax and
+is rejected), the value must not be quote-wrapped, and the Supabase
+`[YOUR-PASSWORD]` placeholder is refused. No error message ever echoes any part
+of the value.
+
+**Percent-encode the password.** `@`, `"`, `]` and other reserved URI
+characters must be encoded (`%40`, `%22`, `%5D`) or both python-dotenv and the
+URL parser misread where the credentials end and the host begins.
+
+**Use the session pooler (port 5432), not the transaction pooler (6543).**
+LangGraph's Postgres checkpointer relies on prepared statements, which the
+transaction pooler does not support. Verified working on 5432.
+
+**Windows:** async psycopg refuses to run on the default `ProactorEventLoop`.
+The composition root must select `WindowsSelectorEventLoopPolicy`
+(`docs/state.md` §5.0.2).
 
 **Impeccable has no enable/disable flag.** It is a mandatory gate, not a feature
 toggle (`docs/design.md` §5). The runtime *probes* whether it is available; if it is
@@ -191,12 +231,26 @@ behavior, and it stays off until measured.
 - Invalid enum values (`APP_ENV`, `LOG_LEVEL`) fail validation rather than silently
   falling back.
 
-## 7. Running It (once implemented)
+## 7. Running It
+
+Both halves run today. Verified 2026-10-09.
 
 ```text
 backend:   uvicorn backend.main:app --reload --host 127.0.0.1 --port 8000
 frontend:  npm --prefix frontend run dev        (port 5173, via .claude/launch.json)
 ```
 
-The frontend proxies or calls `http://127.0.0.1:8000/api/v1` directly, subject to the
-CORS allowlist.
+The frontend calls `http://127.0.0.1:8000/api/v1` directly, subject to the CORS
+allowlist, through `frontend/src/lib/api.ts`. With the backend down, `/chat`
+and `/dashboard` render and show a `client_network_unreachable` notice rather
+than failing silently.
+
+**The backend will not start without `ANTHROPIC_API_KEY`** — configuration is
+fail-fast by design (§6), and the key is required even for routes that never
+call the model. A non-placeholder value satisfies startup; an invalid one fails
+later, at the first provider call, with the run ending in `failed`.
+
+**Windows:** if the async Postgres checkpointer is wired in, the composition
+root must set `WindowsSelectorEventLoopPolicy` before uvicorn starts, or
+psycopg refuses to run on the default `ProactorEventLoop`
+(`docs/state.md` §5.0.2).

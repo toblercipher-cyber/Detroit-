@@ -27,13 +27,27 @@ history.
 - Settings objects must redact secret fields in `repr`/`str` so an accidental log or
   traceback cannot print them.
 - `/api/v1/health` reports `model_configured: bool` — never the key or a prefix of it.
-- **`.env` must be gitignored.** As of this writing the repository's `.gitignore` does
-  **not** ignore `.env`. Adding it is a required pre-implementation step
-  (`docs/runtime.md` §3.1).
+- **`.env` must be gitignored.** **Done** — `.gitignore` line 27 matches `.env`,
+  verified 2026-10-09. Note the pattern matches `.env` exactly: a sibling such as
+  `.env.bak` or `.env.local` would **not** be ignored, so never leave one in the
+  repository.
 - Secrets are never passed into a generated project's environment or build.
-- **Database credentials** (Supabase connection string, service key) are secrets under
-  the same rules. They do not exist yet — the schema is undecided
-  (`docs/architecture.md` §3.8) — and must never be hard-coded when they do.
+- **Database and Supabase credentials exist now** and are secrets under the same
+  rules. They are declared in `backend/config/settings.py` as `SecretStr` and are
+  split by who may see them (`docs/database.md` §1.3.4):
+
+  | Credential | May reach a browser |
+  |---|---|
+  | `SUPABASE_URL` | **yes** — not a secret |
+  | `SUPABASE_PUBLISHABLE_KEY` (anon) | **yes** — but only safe *because RLS is enabled*; with RLS off it is a full read of every user's data |
+  | `SUPABASE_SERVICE_ROLE_KEY` | **NEVER** — bypasses RLS completely |
+  | `SUPABASE_DB_PASSWORD`, `DATABASE_URL` | **NEVER** — the DSN embeds the password |
+
+  The service-role key is read by nothing today and must not be used to serve a
+  user-facing read that RLS could serve instead (§7, least privilege).
+- **A password inside a DSN must be percent-encoded.** `@`, `"`, `]` and friends
+  are reserved in a URI; left raw they break the parser and, worse, can silently
+  shift where the host boundary is read.
 - **Zapier** (deferred) sends data outside the system. A Zapier payload must never
   contain secrets, raw prompts, credentials or full project state, and every send is
   an external write subject to §8.
@@ -168,14 +182,22 @@ returns `403`.
 
 Repository operations are never an implicit side effect of generation.
 
-## 9. Network Exposure (v1)
+## 9. Network Exposure
 
-There is no authentication in v1. Therefore:
+**Authentication is decided (Supabase Auth, `docs/database.md` §1.3) but NOT
+IMPLEMENTED.** Until it is, every constraint below stands unchanged:
 
 - bind to `127.0.0.1` only
 - CORS restricted to an explicit origin allowlist (the Vite dev origin)
 - **do not expose this server publicly in its current state** — a `project_id` alone
   grants read and mutate access to that project
+
+These are consequences of there being no auth, not permanent rules. Lifting the
+loopback binding requires **all three** of: `docs/api.md` §1.1 implemented
+(token verified, routes owner-scoped), RLS enabled on every `public` table, and
+`docs/database.md` §5.2 #7 resolved. Doing one or two of the three produces a
+system that looks protected and is not — the backend currently connects as a
+superuser, which ignores RLS entirely.
 
 ## 10. Logging
 

@@ -95,20 +95,35 @@ spec: docs/frontend.md §4                     spec: §3.4 above + docs/state.md
 
 ## 3.8 Database — Supabase / PostgreSQL
 
-**Decided:** the project's database is **Supabase / PostgreSQL**. This is the
-builder's own persistence layer; it does not contradict the frontend-first rule for
-*generated* websites.
+**Decided:** the project's database is **Supabase / PostgreSQL**, and DETROIT is
+an **authenticated multi-user product** using **Supabase Auth**. This is the
+builder's own persistence and identity layer; it does not contradict the
+frontend-first rule for *generated* websites, which still get no backend, no
+database and no auth of their own.
 
-**Not decided:** schema, tables, columns, migrations and access patterns — these stay
-undecided until the user explicitly defines them.
+**`docs/database.md` is the authority** for every auth and persistence decision:
+the ownership model, the RLS requirement, the `auth.users` / application-table /
+LangGraph-checkpoint boundary, and which Supabase key may reach a browser.
+
+This section previously said schema and access patterns were "not decided" and
+forbade adding a driver. **Both of those are now spent.** Current position:
+
+| | |
+|---|---|
+| Schema | **designed** (`database.md` §3) — though that DDL is superseded by the ownership and RLS requirements (§3.0) |
+| Connection | **live and verified** — PostgreSQL 17.11 via the Supabase session pooler |
+| Driver | `psycopg` 3.3.6 in `.venv`; **not yet declared** in `requirements.txt` |
+| Tables, migrations, RLS, auth code | **none written** |
 
 Consequences for implementation:
 
-- Do not design, invent or scaffold a schema.
-- Do not add a Postgres driver, Supabase client, ORM or migration tool until the
-  schema is defined and approved (`docs/runtime.md` §2.1).
-- Keep persistence behind a narrow interface (`backend/memory/`) so the store can be
-  wired in later without reworking the graph or the API.
+- The architecture is a **third layer**, not two: `auth` (Supabase), `public`
+  (ours, RLS-protected), `langgraph` (the library's, never hand-designed).
+- Keep persistence behind the narrow interface in `backend/memory/`. Postgres
+  arrives as a second implementation behind it, not as a rewrite.
+- **One open decision blocks implementation:** which database role the backend
+  connects as (`database.md` §5.2 #7). Connecting as a superuser bypasses RLS
+  and makes the policy layer decorative.
 - Interim behavior for state persistence: `docs/state.md` §5.
 
 ## 3.9 Zapier — Optional Automation Layer (deferred)

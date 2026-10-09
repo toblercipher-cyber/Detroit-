@@ -10,20 +10,68 @@
 - No API key, token, internal prompt or stack trace ever appears in a response.
 - Base path: **`/api/v1`**. All JSON, UTF-8.
 
-### 1.1 v1 authentication
+### 1.1 Authentication
 
-**There is no authentication in v1.** The backend is a local single-user service.
-Consequences, which are requirements not suggestions:
+**Decided: Supabase Auth, multi-user.** `docs/database.md` §1.3 owns this
+decision; this section owns how it appears over HTTP.
+
+**Status: IMPLEMENTED 2026-10-09.** Every `/projects` route requires a verified
+bearer token and is scoped to the caller. `backend/api/deps.py` owns the
+dependency; `backend/auth/jwt.py` owns verification.
+
+#### The contract
+
+- The frontend authenticates against **Supabase Auth** and receives a JWT.
+- It sends that JWT to this backend as `Authorization: Bearer <token>`.
+- The backend **verifies** the token and derives the user id from it. It never
+  reads an identity from a path, a query parameter or a request body: a client
+  that can name its own user can claim anyone's project
+  (`docs/database.md` §1.3.5).
+- Every `/projects` route becomes a protected route taking that identity as a
+  FastAPI dependency. **Route shapes and response models do not change** — what
+  changes is which rows they can reach.
+- `GET /projects` returns **only the caller's** projects.
+- A project belonging to another user answers **`404 project_not_found`**, not
+  `403`. `403` would confirm the id exists, which is a membership oracle; `404`
+  tells an attacker nothing. A caller who genuinely owns nothing and a caller
+  probing ids get the same answer.
+- Two new codes join §5: `unauthenticated` (401) for a missing, malformed or
+  expired token, and `forbidden` (403) reserved for a verified user attempting
+  something their account is not permitted to do — never for mere ownership,
+  which is `404`.
+
+#### Network posture, still unchanged
+
+Auth is implemented, but the loopback binding stays until it is reviewed as a
+whole. These remain requirements:
 
 - The server binds to `127.0.0.1` only.
-- CORS is restricted to the Vite origin (`http://localhost:5173`) via an explicit
-  allowlist from config.
-- **The server must not be exposed publicly in this state.** Knowing a `project_id`
-  is sufficient to read and mutate that project.
-- Auth is deferred. When it arrives it slots in as a dependency on the project
-  routes; the contract below does not change shape.
+- CORS is restricted to the Vite origin (`http://localhost:5173`) via an
+  explicit allowlist from config.
+- **The server must not be exposed publicly.** Knowing a `project_id` is
+  currently sufficient to read and mutate that project.
+
+The loopback constraint exists *because* there is no auth yet. It is lifted by
+implementing this section — and by resolving `docs/database.md` §5.2 #7, since
+a backend that connects as a superuser bypasses RLS and would make the database
+half of the boundary decorative.
 
 ## 2. Endpoint Contract
+
+> **Implementation status (verified 2026-10-09).** This section is the target
+> contract, and part of it does not exist yet. Implemented in
+> `backend/api/projects.py` and `backend/api/preview.py`: health; `POST`/`GET
+> /projects`; `GET /projects/{id}`; `/status`; `/preview`; `POST
+> /reference-images`; `GET`/`POST /hitl`; `/hitl/history`; `DELETE`; and the
+> static `/preview/{id}/…` router.
+>
+> **Specified below but absent:** the SSE `/events` stream, `POST /messages`,
+> `/build`, `/files`, `/evaluation`, `/evaluation/fixes`, reference-image
+> list/fetch, and all three `/external-actions` routes. Clients must not assume
+> them; `frontend/src/lib/api.ts` deliberately implements only the real set and
+> polls `/status` in place of SSE.
+>
+> **None of these routes is authenticated or owner-scoped yet** (§1.1).
 
 ### 2.1 Health
 
@@ -407,7 +455,9 @@ ErrorBody
 | Code | HTTP | Meaning |
 |---|---|---|
 | `validation_error` | 422 | request model failed validation |
-| `project_not_found` | 404 | unknown `project_id` |
+| `unauthenticated` | 401 | missing, malformed or expired bearer token (§1.1) |
+| `forbidden` | 403 | verified user, but not permitted. **Never used for ownership** — see below |
+| `project_not_found` | 404 | unknown `project_id`, **or a project owned by someone else** (§1.1) |
 | `invalid_stage_for_action` | 409 | action not valid in the current stage |
 | `no_pending_checkpoint` | 409 | HITL submitted with nothing pending |
 | `checkpoint_already_resolved` | 410 | stale or duplicate HITL submit |
@@ -440,5 +490,17 @@ GET  /projects/{id}/preview          -> preview URL once built
 GET  /projects/{id}/status           -> polling fallback if SSE is unavailable
 ```
 
-Only the Chatbot Page calls the backend. Landing and Pricing are static
-(`docs/frontend.md` §4.6).
+**Which surfaces call the backend (verified 2026-10-09).** This was previously
+"only the Chatbot Page", which is no longer true:
+
+| Surface | Calls the backend |
+|---|---|
+| `/chat` | yes — create, status polling, HITL, reference upload |
+| `/dashboard` | yes — `GET /projects`, plus `/{id}` and `/{id}/status` per project |
+| `/login` | **not yet.** It is a placeholder; when wired it talks to **Supabase Auth**, not to this API |
+| `/`, `/features` | no — static |
+| `/pricing` | n/a — not built |
+
+Every call goes through `frontend/src/lib/api.ts`. No page builds a URL or
+reads `import.meta.env` itself, which is what keeps the auth header a
+one-line change in a single file when §1.1 lands.

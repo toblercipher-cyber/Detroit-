@@ -42,11 +42,11 @@ Every implementation decision must trace back to a project requirement, approved
 
 ---
 
-## 3. MANDATORY ONE-FILE EXECUTION GATE
+## 3. MANDATORY FEATURE-BATCH EXECUTION GATE
 
 **This rule is mandatory.**
 
-Claude must work in **one-file-at-a-time mode** unless the user explicitly authorizes a batch of files.
+Related files may be batched in one turn when they form one feature (component + page + route + nav wiring). No orphan components left behind.
 
 ### After completing ONE file
 
@@ -229,7 +229,7 @@ Use FastAPI as the HTTP/API layer connecting the frontend/chat interface to the 
 FastAPI responsibilities:
 - application startup/configuration
 - request/response handling
-- authentication/session integration if later enabled
+- authentication/session integration — **now in scope**: Supabase Auth, JWT verified server-side (`docs/database.md` §1.3.5, `docs/api.md` §1.1). Not yet implemented
 - upload endpoints
 - chat/session endpoints
 - HITL endpoints
@@ -784,6 +784,11 @@ Do not treat repository operations as an implicit side effect of generation.
 ## 22. GENERATED WEBSITE BACKEND POLICY
 
 The generated website itself is frontend-first.
+
+> This section is about the sites DETROIT **builds for a user**, not about
+> DETROIT. DETROIT has its own backend, database and (as of 2026-10-09)
+> Supabase Auth — see `CLAUDE.md` §9A. That is builder infrastructure and does
+> not relax anything below.
 
 Do not silently create:
 - authentication backend

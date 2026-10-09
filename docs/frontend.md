@@ -2,17 +2,39 @@
 
 # Frontend
 
-## 1. v1 Frontend Scope (authoritative)
+## 1. Frontend Scope (authoritative)
+
+Verified against the repository 2026-10-09. The scope has grown past the
+original three routes; each addition was a direct user request.
 
 | Surface | Route | Status |
 |---|---|---|
-| Landing Page | `/` | **Completed and approved** |
-| Pricing Page | `/pricing` | Remaining |
-| Chatbot Page (start / workspace) | `/chat` | Remaining |
+| Landing Page | `/` | **Completed and approved** — preserve, do not redesign |
+| Chatbot workspace | `/chat` | **Built and connected to the real backend** |
+| Dashboard | `/dashboard` | **Built, partly connected.** Project/run data is real; every credit and usage figure has no backend source and is chipped as such in the UI |
+| Product / features | `/features` | **Built** (static) |
+| Login | `/login` | **Built as a deliberate placeholder.** Submits nothing, stores nothing, and is **not linked from the nav** — linking it would advertise an account system that does not exist yet |
+| Pricing Page | `/pricing` | **NOT built.** The route falls through to the Landing Page. The pricing UI exists as `components/pricing-tiers.tsx`, rendered inside `/features` |
 
-**FAQ and Help pages are OUT OF SCOPE for v1.** Do not create them, plan for them,
+**FAQ and Help pages are OUT OF SCOPE.** Do not create them, plan for them,
 link to them, or reserve navigation space for them unless the user explicitly
 requests them later.
+
+### 1.1 Authentication is coming to this layer
+
+DETROIT is now an authenticated multi-user product (`docs/database.md` §1.3).
+Consequences for the frontend, **none of them implemented yet**:
+
+- `/login` gets wired to **Supabase Auth** and its "preview only" notices come out.
+- `/chat` and `/dashboard` become **protected routes** and need a guard plus a
+  session provider.
+- `frontend/src/lib/api.ts` attaches `Authorization: Bearer <jwt>` to every
+  request. It is the only file that touches transport, so this is a one-place
+  change.
+- The frontend uses **`SUPABASE_PUBLISHABLE_KEY` only**. The service-role key
+  and `DATABASE_URL` must never reach a bundle (`docs/database.md` §1.3.4).
+- The account blocks in `/chat` and `/dashboard`, currently reading "Local
+  workspace / No sign-in required", show the real signed-in user.
 
 ## 2. Existing Stack (do not change without approval)
 
@@ -93,16 +115,31 @@ and never name frontend routes after workflow stages.
 
 ### 4.1 Chosen approach: client-side routing with `react-router-dom`
 
-Three routes in one Vite SPA:
+Routes in one Vite SPA (the set has grown since this was written):
 
 ```text
-/          -> Landing Page   (existing, visually unchanged)
-/pricing   -> Pricing Page   (to build)
-/chat      -> Chatbot Page   (to build)
+/            -> Landing Page      (existing, visually unchanged)
+/chat        -> Chatbot workspace (built)
+/dashboard   -> Dashboard         (built)
+/features    -> Product page      (built)
+/login       -> Login placeholder (built, not nav-linked)
+/pricing     -> Pricing Page      (NOT built — currently falls through to Landing)
 ```
 
-> `react-router-dom` is **not yet installed**. Installing it requires explicit user
-> approval. Nothing in this section may be implemented before that approval.
+> **`react-router-dom` is still not installed**, and installing it still
+> requires explicit approval.
+>
+> In the meantime `App.tsx` carries a documented temporary bridge: it reads
+> `location.pathname` once at render and picks a surface from a table. That is
+> **not** the "state-based view switcher" §4.3 rejects — those routes are real,
+> reloadable, shareable URLs with working browser history. What it does not
+> give us, and what the real router is still needed for: client-side
+> transitions, a shared layout with `<Outlet />`, `ScrollToHash` for
+> cross-surface `/#section` links, and session state that survives navigation.
+>
+> **Authentication raises the stakes.** Route guards for `/chat` and
+> `/dashboard` want a router; a `pathname` switch has nowhere clean to put a
+> redirect-to-login.
 
 ### 4.2 Why this fits the existing structure
 
@@ -165,17 +202,35 @@ The Landing Page's in-page anchors (`#top`, `#pipeline`, `#agents`, `#about`,
 5. The existing smooth-scroll and reduced-motion rules in `index.css` stay as they
    are. They are not replaced.
 
-### 4.6 Chatbot page ↔ backend
+### 4.6 Which surfaces talk to the backend
 
-The Chatbot Page is the only surface that talks to the builder backend. It consumes
-the contract in `docs/api.md`:
+This section previously said the Chatbot Page was the only one. That is no
+longer true. Status verified 2026-10-09:
 
-- `POST /api/v1/projects` to start a project
-- `GET /api/v1/projects/{project_id}/events` (SSE) for live stage/progress
-- `GET /api/v1/projects/{project_id}/hitl` and `POST .../hitl` for approval gates
-- `GET /api/v1/projects/{project_id}/preview` for the generated-site preview
+| Surface | Talks to the builder backend |
+|---|---|
+| `/chat` | yes — create, status polling, HITL, reference-image upload |
+| `/dashboard` | yes — `GET /projects`, plus `/{id}` and `/{id}/status` per project |
+| `/login` | not yet; when wired it talks to **Supabase Auth**, not to this API |
+| `/`, `/features` | no — static |
 
-The Landing and Pricing pages stay fully static and make no backend calls.
+All traffic goes through **`frontend/src/lib/api.ts`**, which implements only
+the routes the backend actually serves. No page builds a URL, reads
+`import.meta.env`, or decodes an error envelope itself.
+
+**SSE does not exist.** `docs/api.md` §2.8 specifies
+`GET /projects/{id}/events`, and the backend implements no such route — there
+is no `StreamingResponse` anywhere in it. The client therefore polls
+`GET /status`, which §2.8 itself names as the supported fallback. Nothing in
+the frontend synthesizes `stage_changed`, `agent_started` or `build_progress`
+events the backend never emits.
+
+**Two further gaps the UI works around rather than fakes:** there is no
+`POST /messages`, so the composer starts a project and is then disabled for the
+life of that run (refinement goes through the HITL custom instruction); and the
+preview is not embedded, because `backend/api/preview.py` sends
+`frame-ancestors 'self'` where `'self'` is the *backend* origin, so an iframe
+served from `:5173` would be blocked.
 
 ## 5. Chatbot Reference
 
@@ -221,3 +276,7 @@ telemetry + stage progress, center = the HITL conversation and preview.
 | `src/components/ui/pricing-card.tsx` | 0 importers — staged for the Pricing page; never rendered, so it is **not** part of the approved Landing Page. Its treatment is a Design-stage decision (see `docs/design.md`). |
 | `src/assets/pricing-bg.jpg` | named for Pricing but currently consumed by `about-section.tsx` |
 | No linter / formatter / test runner | the only executable frontend check is `npm run build` (`tsc -b && vite build`) |
+| `src/assets/dashboard-page-bg.jpg` | now used by **both** `/dashboard` and `/chat`; the name no longer describes it. Renaming touches two pages |
+| Collapsing side rail | duplicated between `pages/chat.tsx` and `pages/dashboard.tsx`; so is the `WorkflowStage` label table. Both want extracting |
+| `/pricing` dead links | the Dashboard's Billing nav item and the Plan card's "Change" link both point at a route that renders the Landing Page |
+| `three` bundle | `agentic-factory-3d.tsx` pulls ~626 kB. Code-split and gated on an IntersectionObserver, so the initial bundle is unaffected, but a visitor who scrolls to the demo downloads it |

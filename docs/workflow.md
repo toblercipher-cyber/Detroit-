@@ -199,20 +199,19 @@ This governs how **this project itself** is built, and is non-negotiable
 (`CLAUDE.md` §1A, `skills.md` §3):
 
 ```text
-ONE FILE AT A TIME
-  create one file
+ONE FEATURE AT A TIME
+  create the files that feature needs
   -> read the created file back
   -> review it against CLAUDE.md + skills.md + the relevant docs/
   -> validate with whatever checks actually exist (§7.1)
   -> report what was created, why it exists, and any issues/risks
   -> STOP
-  -> ask whether to create the next file
+  -> ask whether to start the next feature
   -> wait for explicit approval
   -> re-read CLAUDE.md + skills.md before starting the next file
 ```
 
-Never create multiple implementation files in one step without explicit batch
-authorization.
+Never leave an orphan component behind: a batch wires what it creates.
 
 ### 7.1 What "validate" concretely means
 

@@ -30,16 +30,16 @@ Before starting any new file, Claude Code must re-read `CLAUDE.md` and `skills.m
 
 Never proceed to a new implementation file using conversation memory alone when these project documents are available.
 
-### One-file development gate
+### Feature-batch development gate
 
-Unless the user explicitly authorizes a batch, create or modify **one file at a time**. After completing a file:
+Related files may be batched in one turn when they form one feature (component + page + route + nav wiring). No orphan components left behind. After completing a file:
 
 1. Re-read the file.
 2. Review the code against `CLAUDE.md` and `skills.md`.
 3. Run the relevant checks.
 4. Tell the user what was done and why the file exists.
-5. Stop and ask: **“Please review this file/code. Should I create the next file?”**
-6. Do not create another file until the user explicitly approves.
+5. Stop and ask: **“Please review this code. Should I start the next feature?”**
+6. Do not start another feature until the user explicitly approves.
 7. Before starting the next file, read `CLAUDE.md` and `skills.md` again.
 
 Every newly created source/config file should include a concise top-level comment/docstring explaining its architectural purpose and why it exists.
@@ -59,6 +59,12 @@ The core generator builds:
 Do **not** automatically invent or generate a full production backend architecture, database schema, authentication server, payment backend, microservices, or infrastructure unless the product scope is explicitly expanded later.
 
 The user may connect or implement their own backend separately.
+
+> **This rule is about the websites DETROIT GENERATES, not about DETROIT.**
+> DETROIT itself has a backend (FastAPI + LangGraph), a database
+> (Supabase/PostgreSQL) and, as of 2026-10-09, authentication (Supabase Auth) —
+> all approved builder infrastructure under §9A. A generated coffee-shop
+> landing page still gets none of those.
 
 ### Preserve user decisions
 Never make the user re-decide something they have already explicitly specified or approved.
@@ -315,28 +321,57 @@ iteration_history.json
 
 Do not duplicate the same source of truth across many files without a clear reason.
 
-## 9A. Builder Persistence / Database
+## 9A. Builder Persistence, Database & Authentication
 
 ### Decided
 
-The project's database is **Supabase / PostgreSQL**. It is the builder's own
-persistence layer — it does not contradict §2, which forbids inventing a database for
-a *generated* website.
+The project's database is **Supabase / PostgreSQL**, and DETROIT is an
+**authenticated multi-user product** built on **Supabase Auth**. Both are the
+builder's own infrastructure — neither contradicts §2, which forbids inventing a
+backend, database or auth server for a *generated* website.
 
-### Not yet decided
+**`docs/database.md` is the authority** for every authentication and persistence
+decision: the ownership model, the RLS requirement, the `auth.users` /
+application-table / LangGraph-checkpoint boundary, and which Supabase key may
+reach a browser. Read it before touching either subject.
 
-**Schema, tables, columns, migrations and access patterns are undecided** and remain
-so until the user explicitly defines them.
+### The former prohibition is lifted
 
-Therefore:
-- Do **not** design, invent or scaffold a schema.
-- Do **not** add a database driver, ORM, Supabase client or migration tool until the
-  schema is defined and approved.
-- Do **not** write persistence code against an assumed table shape.
-- Keep the persistence layer behind a narrow interface so the backing store can be
-  wired in once the schema exists, without reworking the graph or the API.
+This section used to forbid adding a driver "until the schema is defined and
+approved". **That condition is met.** The schema is designed (`docs/database.md`
+§3) and the connection to Supabase PostgreSQL is live and verified. The
+prohibition is history, not standing policy.
 
-See `docs/state.md` §5 for what this means for state persistence in the interim.
+### Status (verified 2026-10-09)
+
+| | |
+|---|---|
+| Connection | **live** — PostgreSQL 17.11 via the Supabase session pooler |
+| `DATABASE_URL` + four `SUPABASE_*` vars | declared in `settings.py`, secrets as `SecretStr` |
+| `psycopg` 3.3.6 + `langgraph-checkpoint-postgres` 3.1.2 | installed and declared |
+| Migrations 0001 + 0002 | **applied** — 6 tables, RLS forced, 14 policies |
+| Backend app role | **`detroit_app`**, `NOBYPASSRLS`; `postgres` only for migrations/checkpointer |
+| Auth | Supabase Auth, ES256/JWKS verified server-side; every project route owner-scoped |
+
+### Still binding
+
+- The DDL in `docs/database.md` §3 is **superseded** — it predates ownership and
+  RLS. Do not run it (§3.0).
+- **No ORM.** The `StateRepository` Protocol plus psycopg is the whole stack; an
+  ORM would add a second schema definition to keep in sync with the Pydantic
+  models.
+- **Never hand-write LangGraph's checkpoint tables.** They belong to
+  `langgraph-checkpoint-postgres` (§1.2).
+- Keep persistence behind the narrow interface in `backend/memory/`. Postgres is
+  a second implementation behind it, not a rewrite.
+- **Ownership and RLS land together.** A tenant column without RLS is worse than
+  neither, because the schema then looks multi-tenant while enforcing nothing.
+- The backend connects as **`detroit_app`** for application queries. Never use
+  the `postgres` DSN for them: it carries `BYPASSRLS` and would silently
+  disable every policy (`docs/database.md` §5.2, resolved).
+
+See `docs/state.md` §5 for what still runs today — the interim filesystem
+repository and `InMemorySaver` are both still live.
 
 ### Not the database
 
@@ -800,14 +835,24 @@ Do not recreate files that already exist or redesign completed subsystems withou
 
 ### v1 frontend scope (authoritative)
 
+Verified against the repository 2026-10-09. `docs/frontend.md` §1 is the
+authority; this table mirrors it.
+
 | Surface | Route | Status |
 |---|---|---|
 | `landing_page` | `/` | **Completed and approved** — preserve, do not redesign |
-| `pricing_page` | `/pricing` | Remaining |
-| `chatbot_page` (start / workspace) | `/chat` | Remaining |
+| `chatbot_page` (workspace) | `/chat` | **Built, connected to the real backend** |
+| `dashboard_page` | `/dashboard` | **Built, partly connected** — project/run data real; credit/usage figures have no backend source and are marked in the UI |
+| `features_page` | `/features` | **Built** (static) |
+| `login_page` | `/login` | **Built as a placeholder** — submits nothing, stores nothing, not nav-linked |
+| `pricing_page` | `/pricing` | **NOT built** — the route falls through to the Landing Page |
 
-`faq_page` and `help_page` are **OUT OF SCOPE** for v1. Do not create, plan, link
+`faq_page` and `help_page` are **OUT OF SCOPE**. Do not create, plan, link
 to, or design toward them unless the user explicitly requests them later.
+
+**Authentication will make `/chat` and `/dashboard` protected routes.** Nothing
+of that is implemented; `react-router-dom` is still not installed and `App.tsx`
+uses a temporary `location.pathname` bridge.
 
 Routing approach is specified in `docs/frontend.md`.
 
