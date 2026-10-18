@@ -60,12 +60,19 @@
  *   dressed up as an event stream and emits no event type the backend does not
  *   produce.
  *
- * NO AUTH, BY DESIGN
- *   `docs/api.md` §1.1: there is no authentication in v1. The backend binds to
- *   loopback and CORS is an explicit allowlist with `allow_credentials=False`,
- *   so requests here send no credentials and no `Authorization` header. There
- *   is also nothing to put in one — no key, no token, ever, in frontend code
+ * AUTHENTICATED WITH A BEARER TOKEN
+ *   Every request carries `Authorization: Bearer <supabase access token>`,
+ *   read per call from `@/lib/auth` so a long-idle tab sends a refreshed token
+ *   rather than an expired one. The backend verifies the signature and derives
+ *   the owner from it; nothing this client sends about itself is trusted
+ *   (`docs/api.md` §1.1, `docs/database.md` §1.3.5).
+ *
+ *   The token is the ONLY credential that appears here. No provider key, no
+ *   service-role key, no database URL — those are server-side only
  *   (`docs/security.md` §2).
+ *
+ *   This block previously read "NO AUTH, BY DESIGN". That was true before
+ *   Supabase Auth landed and is now the opposite of what the code does.
  *
  * CORS NOTE THAT AFFECTS THIS FILE
  *   The backend allows methods GET/POST/DELETE and the single request header
@@ -372,6 +379,9 @@ export interface ProjectSummary {
   stage: WorkflowStage;
   status: RunStatus;
   updated_at: IsoDateTime;
+  created_at: IsoDateTime;
+  /** Automatic correction passes used so far. */
+  iteration_count: number;
 }
 
 export interface ProjectSummaryList {
@@ -445,14 +455,28 @@ export interface ReferenceImageResponse {
 /**
  * Where the built output is served, and whether it reflects the current files.
  *
- * `preview_url` is backend-relative (`/preview/{project_id}/`), so it must be
- * resolved against `API_BASE_URL` before it goes in an iframe — the frontend
- * dev server is a different origin and would 404 on it. Use `previewSrc`.
+ * `preview_url` is backend-relative, so it must be resolved against
+ * `API_BASE_URL` before it goes in an iframe — the frontend dev server is a
+ * different origin and would 404 on it. Use `previewSrc`.
+ *
+ * IT IS A CREDENTIAL, AND IT EXPIRES
+ *   The URL is `/preview/{token}/`, not `/preview/{project_id}/`. A browser
+ *   loading a preview in a tab or an iframe cannot send an `Authorization`
+ *   header, so the right to read that project's output travels in the URL as
+ *   a signed, five-minute token.
+ *
+ *   Two consequences for a caller. Do not cache or persist this string —
+ *   re-request the endpoint when `expires_at` approaches, because a stale URL
+ *   answers 404. And do not log it, put it in an error message, or show it
+ *   anywhere it could be copied: anyone holding it can read the project's
+ *   built output until it expires.
  */
 export interface PreviewResponse {
   preview_url: string;
   built_at: IsoDateTime;
   status: PreviewFreshness;
+  /** When `preview_url` stops working. Re-request this endpoint before then. */
+  expires_at: IsoDateTime;
 }
 
 /* ------------------------------------------------------------------ *
@@ -574,7 +598,7 @@ export function isApiError(value: unknown, code?: string): value is ApiError {
  * ------------------------------------------------------------------ */
 
 interface RequestOptions {
-  method?: "GET" | "POST" | "DELETE";
+  method?: "GET" | "POST" | "PUT" | "DELETE";
   /** Serialized as JSON. Omit for GET/DELETE and for multipart. */
   json?: unknown;
   /** Sent as-is; the browser sets the multipart boundary. */
@@ -626,9 +650,11 @@ async function toApiError(response: Response): Promise<ApiError> {
  * One request. Every call below goes through here, so error decoding, JSON
  * headers and abort handling exist in exactly one place.
  *
- * `credentials` is left at the default (omitted cross-origin): the backend sets
- * `allow_credentials=False` and there is no authentication in v1, so sending
- * any would be rejected by CORS and would imply a session that does not exist.
+ * `credentials` is left at the default (omitted cross-origin), and that is
+ * still correct under authentication: the session travels in the
+ * `Authorization` header, not in a cookie, so there is nothing for the browser
+ * to attach. The backend sets `allow_credentials=False`, which a cookie-based
+ * session would have required changing.
  */
 async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const { method = "GET", json, body, signal } = options;
@@ -849,11 +875,171 @@ export function deleteProject(projectId: string, signal?: AbortSignal): Promise<
  * knowledge in the transport layer instead of in every component that embeds a
  * preview. The route lives outside `/api/v1` on purpose — it serves files, not
  * typed JSON (`docs/architecture.md` §5.4).
+ *
+ * The path already carries a short-lived signed token, so the result is
+ * directly usable as an iframe `src` with no header to attach — which is the
+ * whole reason the token is in the URL. It expires: see `PreviewResponse`.
  */
 export function previewSrc(preview: PreviewResponse | string): string {
   const path = typeof preview === "string" ? preview : preview.preview_url;
   return `${API_BASE_URL}${path.startsWith("/") ? path : `/${path}`}`;
 }
+
+/* ------------------------------------------------------------------ *
+ * GitHub integration (`docs/mcp.md` §2.1)
+ *
+ * NO CREDENTIAL EVER CROSSES THIS BOUNDARY. `GitHubStatus` carries booleans
+ * and an account name; the token lives in server configuration and no route
+ * returns it, echoes it, or encodes anything derived from it.
+ * ------------------------------------------------------------------ */
+
+export interface GitHubStatus {
+  /** Verified by a real call, not by a variable being set. */
+  configured: boolean;
+  mode: "rest" | "mcp" | "none";
+  /** Why it is unusable, safe to display. Empty when it works. */
+  reason: string;
+  mcp_server_configured: boolean;
+  mcp_tools_discovered: number | null;
+  account: string | null;
+}
+
+export interface RepositorySummary {
+  full_name: string;
+  default_branch: string;
+  private: boolean;
+  /** False means it can be listed but not selected. */
+  can_push: boolean;
+  html_url: string;
+}
+
+export interface GitHubLink {
+  connected: boolean;
+  repository: string | null;
+  default_branch: string | null;
+  branch: string | null;
+  last_pushed_at: IsoDateTime | null;
+  last_commit_sha: string | null;
+}
+
+/** Push emits exactly these. Pull/import was removed. */
+export type SyncChangeKind = "add" | "update" | "skip";
+
+export interface SyncChange {
+  path: string;
+  kind: SyncChangeKind;
+  reason: string;
+  size_bytes: number;
+}
+
+/**
+ * What a push WOULD do, plus the approval needed to do it.
+ *
+ * `approval_token` is single-use and short-lived. It is the same two-phase
+ * gate every external write uses: this call mutates nothing, and the execute
+ * call refuses without the token.
+ */
+export interface SyncPlan {
+  direction: "push";
+  repository: string;
+  branch: string;
+  base_branch: string;
+  added: number;
+  updated: number;
+  skipped: number;
+  changes: SyncChange[];
+  plan_id: string;
+  approval_token: string;
+  expires_at: IsoDateTime;
+}
+
+export interface SyncResult {
+  direction: "push";
+  repository: string;
+  branch: string;
+  files_written: number;
+  commit_sha: string | null;
+  detail: string;
+}
+
+export interface ExecuteSyncRequest {
+  plan_id: string;
+  approval_token: string;
+  commit_message?: string;
+}
+
+/** `GET /api/v1/github/status`. */
+export function getGitHubStatus(signal?: AbortSignal): Promise<GitHubStatus> {
+  return request<GitHubStatus>("/github/status", { signal });
+}
+
+/** `GET /api/v1/github/repositories`. */
+export function listRepositories(
+  signal?: AbortSignal,
+): Promise<{ repositories: RepositorySummary[] }> {
+  return request<{ repositories: RepositorySummary[] }>("/github/repositories", {
+    signal,
+  });
+}
+
+/** `GET /api/v1/projects/{id}/github`. */
+export function getGitHubLink(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<GitHubLink> {
+  return request<GitHubLink>(`/projects/${encodeURIComponent(projectId)}/github`, {
+    signal,
+  });
+}
+
+/** `PUT /api/v1/projects/{id}/github` — connect a repository. */
+export function selectRepository(
+  projectId: string,
+  payload: { repository: string; branch?: string },
+  signal?: AbortSignal,
+): Promise<GitHubLink> {
+  return request<GitHubLink>(`/projects/${encodeURIComponent(projectId)}/github`, {
+    method: "PUT",
+    json: payload,
+    signal,
+  });
+}
+
+/** `DELETE /api/v1/projects/{id}/github`. Touches nothing on GitHub. */
+export function disconnectRepository(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<void> {
+  return request<void>(`/projects/${encodeURIComponent(projectId)}/github`, {
+    method: "DELETE",
+    signal,
+  });
+}
+
+/** `POST .../github/push/preview` — mutates nothing, returns the approval. */
+export function previewPush(
+  projectId: string,
+  signal?: AbortSignal,
+): Promise<SyncPlan> {
+  return request<SyncPlan>(
+    `/projects/${encodeURIComponent(projectId)}/github/push/preview`,
+    { method: "POST", signal },
+  );
+}
+
+/** `POST .../github/push` — requires the token from the preview. */
+export function executePush(
+  projectId: string,
+  payload: ExecuteSyncRequest,
+  signal?: AbortSignal,
+): Promise<SyncResult> {
+  return request<SyncResult>(
+    `/projects/${encodeURIComponent(projectId)}/github/push`,
+    { method: "POST", json: payload, signal },
+  );
+}
+
+
 
 /* ------------------------------------------------------------------ *
  * Status polling — the documented SSE fallback (`docs/api.md` §2.8).

@@ -45,7 +45,7 @@ import { AboutSection } from "@/components/about-section";
 import { DashboardSection } from "@/components/dashboard-section";
 import { HarnessSection } from "@/components/harness-section";
 import { McpSection } from "@/components/mcp-section";
-import { DemoVideoSection } from "@/components/demo-video-section";
+import { RunBentoSection } from "@/components/run-bento-section";
 import { FooterSection } from "@/components/footer-section";
 import { ChatPage } from "@/pages/chat";
 import { DashboardPage } from "@/pages/dashboard";
@@ -62,7 +62,7 @@ function LandingPage() {
       <DashboardSection />
       <HarnessSection />
       <McpSection />
-      <DemoVideoSection />
+      <RunBentoSection />
       <FooterSection />
     </main>
   );
@@ -99,6 +99,19 @@ function currentPath(): string {
 }
 
 /**
+ * Path AND query, for the `next` parameter.
+ *
+ * `currentPath()` normalises away the query so it can be matched against the
+ * surface table, which is right for routing and wrong for "send me back where
+ * I was": `/chat?project=<id>` deep-links one project, so dropping the query
+ * would sign someone in and then land them on an empty workspace instead of
+ * the build they clicked.
+ */
+function currentHref(): string {
+  return `${window.location.pathname}${window.location.search}`;
+}
+
+/**
  * Renders a protected surface, or sends the visitor to sign in.
  *
  * `status === "loading"` is handled as its own case, deliberately. Restoring a
@@ -117,7 +130,7 @@ function Guarded({ Surface }: { Surface: ComponentType }) {
 
   useEffect(() => {
     if (status === "anonymous") {
-      const next = encodeURIComponent(currentPath());
+      const next = encodeURIComponent(currentHref());
       window.location.replace(`/login?next=${next}`);
     }
   }, [status]);

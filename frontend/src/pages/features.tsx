@@ -37,6 +37,7 @@ import featuresHeroBg from "@/assets/features-hero-bg.jpg";
 import featuresTraceBg from "@/assets/features-trace-bg.jpg";
 import featuresWorkflowBg from "@/assets/features-workflow-bg.jpg";
 import { PricingTiers } from "@/components/pricing-tiers";
+import ShutterGlyphFooter from "@/components/ui/shutter-glyph-footer";
 import { AgentTrace, type TraceSpan } from "@/components/ui/agent-trace";
 import { Button } from "@/components/ui/button";
 import ContributionSkyline from "@/components/ui/contribution-skyline";
@@ -378,6 +379,52 @@ export function FeaturesPage() {
       {/* ---------- Pricing ---------- */}
       <PricingTiers />
 
+      {/* ---------- Footer ----------
+          The component ships its own scoped stylesheet and its own SVG
+          alphabet, so it is themed through props rather than edited.
+
+          Every colour below is a reference to the token in `index.css`, not a
+          hex copied out of it — the previous pass hardcoded `#110f0e` and
+          `#f5f2ef`, which is the same thing right up until a token moves. The
+          component feeds these straight into CSS custom properties, so any
+          valid CSS colour works.
+
+          What this fixes (`docs/design.md` §2): the footer had no accent at
+          all. It rendered as a flat cream-on-black slab with the ember hue —
+          the one thing carrying emphasis across every other surface —
+          missing, and the full-bleed wordmark at body-text contrast was the
+          brightest element on the site. Now ember marks the shutter, the
+          submit arrow, link hover and focus rings, the wordmark drops to
+          `--muted-foreground` — the token that already means "de-emphasised"
+          here, and warm rather than the neutral grey a plain dimming gives —
+          and the mono is Space Mono like the rest of the project rather than
+          the component's own JetBrains-first stack.
+
+          The shutter sits on the "R" of DETROIT. */}
+      <ShutterGlyphFooter
+        brand="DETROIT"
+        company="DETROIT-AI · Prompt to live page"
+        since={2025}
+        shutterAt={3}
+        className="border-t border-border"
+        background="hsl(var(--background))"
+        backgroundTop="hsl(var(--card))"
+        ink="hsl(var(--foreground))"
+        accent="hsl(var(--ember))"
+        markInk="hsl(var(--muted-foreground))"
+        fontMono="'Space Mono', monospace"
+        signupLabel="Build notes, pipeline changes and release news"
+        placeholder="Email address"
+        socials={[
+          { label: "Product", href: "/features" },
+          { label: "Builder", href: "/chat" },
+          { label: "Dashboard", href: "/dashboard" },
+        ]}
+        legal={[
+          { label: "Pricing", href: "/features#pricing" },
+          { label: "Sign in", href: "/login" },
+        ]}
+      />
     </div>
   );
 }

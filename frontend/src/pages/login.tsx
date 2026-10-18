@@ -10,21 +10,20 @@
  * Layer: frontend presentation (route page component).
  *
  * ---------------------------------------------------------------------------
- * A PLACEHOLDER, ON PURPOSE
+ * NO LONGER A PLACEHOLDER
  *
- * `docs/api.md` §1.1: "There is no authentication in v1. The backend is a
- * local single-user service." There is no auth route, no user record and no
- * session anywhere in `backend/`, and CLAUDE.md §2 forbids inventing one.
+ * This page used to authenticate nobody, and said so at length, because there
+ * was no auth anywhere in the product. Supabase Auth is now live
+ * (`docs/database.md` §1.3): `AuthUI` is wired to the real `signIn`/`signUp`
+ * in `@/lib/auth`, a successful submit produces a real session, and
+ * `App.tsx` guards `/chat` and `/dashboard` against its absence.
  *
- * So this page is built and reachable, but it authenticates nobody. The notice
- * below is persistent rather than only appearing on submit, because someone
- * should know before they type a password into it, not after. Nothing entered
- * here is sent anywhere or stored anywhere.
+ * The old notice claiming nothing was sent or stored has been removed. It was
+ * describing a build that no longer exists, and a false reassurance next to a
+ * password field is worse than none.
  *
- * NOT LINKED FROM THE NAVIGATION, and deliberately. Putting "Sign in" in
- * `site-nav.tsx` would advertise a working account system that does not exist.
- * The route is reachable at `/login` so it can be reviewed; the nav entry is
- * the last step once real auth lands, not this one.
+ * STILL NOT LINKED FROM THE NAVIGATION. That is now a UX decision rather than
+ * an honesty one, and changing it belongs with whoever owns the nav.
  *
  * NOT IN THE v1 SCOPE TABLE. `docs/frontend.md` §1 lists `/`, `/pricing` and
  * `/chat`; `/login` is a scope expansion requested directly by the user, as
@@ -34,10 +33,40 @@
 
 import { ArrowLeft, ShieldAlert } from "lucide-react";
 
+import { AppFooterBar } from "@/components/app-footer-bar";
 import { AuthUI } from "@/components/ui/auth-ui";
 
-/** Where a successful sign-in lands. The workspace, not the marketing page. */
+/** Where a successful sign-in lands when nothing else is requested. */
 const REDIRECT_AFTER_LOGIN = "/chat";
+
+/**
+ * Where to go after signing in.
+ *
+ * WHY THIS EXISTS
+ *   `App.tsx`'s route guard already redirects an anonymous visitor to
+ *   `/login?next=<path>`. Nothing read that parameter, so someone bounced off
+ *   `/dashboard` signed in and landed on `/chat` — the guard recorded where
+ *   they were going and the login page threw it away.
+ *
+ * WHY ONLY A SAME-SITE PATH IS ACCEPTED
+ *   `next` comes from the URL, so it is attacker-controllable. Echoing it into
+ *   a navigation unchecked is an open redirect: `/login?next=https://evil.example`
+ *   would send someone who just authenticated straight off-site, on a link
+ *   that looks like ours. So it must start with a single `/` and must not
+ *   start with `//` or `/\`, both of which browsers read as protocol-relative
+ *   URLs pointing at another host.
+ */
+function redirectTarget(): string {
+  const next = new URLSearchParams(window.location.search).get("next");
+  if (!next) return REDIRECT_AFTER_LOGIN;
+  if (!next.startsWith("/")) return REDIRECT_AFTER_LOGIN;
+  if (next.startsWith("//") || next.startsWith("/\\")) return REDIRECT_AFTER_LOGIN;
+  /* `/login` itself would loop. Compared on the PATH alone, so
+     `/login?next=...` cannot slip past by carrying a query string. */
+  const path = next.split(/[?#]/)[0].replace(/\/+$/, "").toLowerCase();
+  if (path === "/login") return REDIRECT_AFTER_LOGIN;
+  return next;
+}
 
 export function LoginPage() {
   return (
@@ -66,20 +95,39 @@ export function LoginPage() {
           /* A full navigation, not a router push: `react-router-dom` is still
              not installed and App.tsx reads `location.pathname` once at
              render, so only a real navigation changes the surface. */
-          window.location.assign(REDIRECT_AFTER_LOGIN);
+          window.location.assign(redirectTarget());
         }}
       />
 
       {/* Persistent, and positioned over the form column so it is read before
           anything is typed — not after a submit. */}
       <div className="pointer-events-none absolute inset-x-0 bottom-0 z-20 p-6 md:w-1/2">
-        <p className="mx-auto flex max-w-[350px] items-start gap-2.5 rounded-lg border border-border bg-card/80 px-3.5 py-2.5 text-[12px] leading-relaxed text-muted-foreground backdrop-blur-sm">
-          <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-400" />
-          <span>
-            Accounts are handled by Supabase Auth. DETROIT never sees your
-            password.
-          </span>
-        </p>
+        <div className="mx-auto max-w-[350px]">
+          <p className="flex items-start gap-2.5 rounded-lg border border-border bg-card/80 px-3.5 py-2.5 text-[12px] leading-relaxed text-muted-foreground backdrop-blur-sm">
+            <ShieldAlert size={14} className="mt-0.5 shrink-0 text-amber-400" />
+            <span>
+              Accounts are handled by Supabase Auth. DETROIT never sees your
+              password.
+            </span>
+          </p>
+
+          {/* Inside the bottom overlay rather than appended below the auth
+              panel: both panels are `min-h-screen`, so a footer in normal
+              flow would sit a full viewport down where nobody would see it.
+              No brand lockup — this page already floats one top-left — and
+              only public destinations, since `/chat` and `/dashboard` are
+              guarded and would bounce an anonymous visitor straight back
+              here. */}
+          <AppFooterBar
+            current="/login"
+            showBrand={false}
+            links={[
+              { label: "Home", href: "/" },
+              { label: "Product", href: "/features" },
+            ]}
+            className="pointer-events-auto mt-3 border-t-0 px-0 py-0"
+          />
+        </div>
       </div>
     </main>
   );

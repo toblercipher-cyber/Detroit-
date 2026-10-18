@@ -79,7 +79,6 @@ import {
   ArrowUp,
   Check,
   ChevronRight,
-  Github,
   Layers,
   LayoutDashboard,
   type LucideIcon,
@@ -88,7 +87,6 @@ import {
   Paperclip,
   Plus,
   ScanEye,
-  Settings,
   ShieldCheck,
   Sparkles,
   TriangleAlert,
@@ -106,6 +104,7 @@ import {
   createProject,
   getPendingCheckpoint,
   getProject,
+  getProjectStatus,
   isApiError,
   isTerminalStatus,
   listProjects,
@@ -122,6 +121,16 @@ import {
   type StatusResponse,
   type WorkflowStage,
 } from "@/lib/api";
+import {
+  subscribeToRun,
+  type ActivityEntry,
+  type ConnectionState,
+  type QualityVerdict,
+} from "@/lib/agui";
+import { ActivityTimeline } from "@/components/activity-timeline";
+import { AccountBadge } from "@/components/account-badge";
+import { AppFooterBar } from "@/components/app-footer-bar";
+import { GitHubPanel } from "@/components/github-panel";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -206,20 +215,7 @@ const WORKSPACE_LINKS: { href: string; label: string; icon: LucideIcon }[] = [
   { href: "/features", label: "Product", icon: Sparkles },
 ];
 
-/**
- * MCP servers the project intends to integrate (`docs/mcp.md`).
- *
- * No backend route reports connection state — `tools/mcp_client.py` performs
- * discovery only and nothing exposes it over HTTP. So this lists the intended
- * integrations and says the status is unavailable, rather than showing a
- * "Connected" pill that nothing stands behind.
- */
-const MCP_SERVERS: { name: string; icon: LucideIcon }[] = [
-  { name: "GitHub", icon: Github },
-  { name: "Claude", icon: Sparkles },
-  { name: "Cursor", icon: Layers },
-  { name: "Lovable", icon: ScanEye },
-];
+
 
 const PROMPT_STARTERS = [
   {
@@ -632,12 +628,57 @@ function Rail({
 }
 
 /* ------------------------------------------------------------------ *
+ * Deep-linking one project
+ * ------------------------------------------------------------------ */
+
+/**
+ * The project id in `?project=`, or null.
+ *
+ * WHY THIS EXISTS
+ *   The Dashboard lists a user's projects and has to be able to open one.
+ *   Without this the workspace could only ever open a project the visitor
+ *   clicked in its own left rail, so "resume this build" was unreachable from
+ *   anywhere else and a paused HITL gate could not be linked to.
+ *
+ * NOT TRUSTED, AND IT DOES NOT NEED TO BE
+ *   This is a URL, so anyone can put any id in it. Nothing here checks
+ *   ownership and nothing here should: every route the workspace then calls is
+ *   owner-scoped from the verified bearer token, so another user's id simply
+ *   answers 404 and lands in the normal error path (`docs/api.md` §1.1,
+ *   verified by `backend/tests/suites/isolation_check.py`). The guard against
+ *   cross-user access is the backend, never the shape of a query string.
+ */
+function projectIdFromUrl(): string | null {
+  const raw = new URLSearchParams(window.location.search).get("project");
+  const id = raw?.trim();
+  return id ? id : null;
+}
+
+/**
+ * Keep the address bar matching the open project without navigating.
+ *
+ * `replaceState` rather than a navigation: `App.tsx` reads
+ * `location.pathname` once at render (`docs/frontend.md` §4.1), so a real
+ * navigation would remount the whole workspace and drop the live run. Without
+ * this, switching projects in the rail and then reloading would silently
+ * reopen whichever project the URL still named.
+ */
+function syncProjectInUrl(projectId: string | null): void {
+  const url = new URL(window.location.href);
+  if (projectId) url.searchParams.set("project", projectId);
+  else url.searchParams.delete("project");
+  window.history.replaceState(null, "", url);
+}
+
+/* ------------------------------------------------------------------ *
  * Page
  * ------------------------------------------------------------------ */
 
 export function ChatPage() {
   const [projects, setProjects] = useState<ProjectSummary[]>([]);
-  const [activeId, setActiveId] = useState<string | null>(null);
+  /* Initialised from the URL so a link from the Dashboard opens that project
+     on first render, before any fetch resolves. */
+  const [activeId, setActiveId] = useState<string | null>(projectIdFromUrl);
   const [status, setStatus] = useState<StatusResponse | null>(null);
   const [project, setProject] = useState<ProjectStateResponse | null>(null);
   const [checkpoint, setCheckpoint] = useState<HitlCheckpoint | null>(null);
@@ -646,6 +687,10 @@ export function ChatPage() {
   const [localPrompt, setLocalPrompt] = useState<string | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
   const [creating, setCreating] = useState(false);
+  const [activity, setActivity] = useState<ActivityEntry[]>([]);
+  const [quality, setQuality] = useState<QualityVerdict | null>(null);
+  const [connection, setConnection] = useState<ConnectionState>("connecting");
+  const [connectionDetail, setConnectionDetail] = useState("");
 
   const [draft, setDraft] = useState("");
   const [leftOpen, setLeftOpen] = useState(false);
@@ -666,22 +711,89 @@ export function ChatPage() {
     void refreshProjects();
   }, [refreshProjects]);
 
-  /* Poll `GET /status` — the fallback `docs/api.md` §2.8 names, because the
-     SSE route it specifies does not exist in the backend. Polling stops once
-     the run settles; `awaiting_hitl` is deliberately not settled, since the
-     client has to see the resume. */
   const settled = status ? isTerminalStatus(status.status) : false;
 
+  /* LIVE ACTIVITY COMES FROM THE AG-UI STREAM, NOT FROM POLLING.
+     The stream carries what the graph is actually doing; `GET /status` only
+     ever carried a stage name. Polling survives below as the RECOVERY path,
+     because a stream that drops must not leave the UI frozen. */
   useEffect(() => {
-    if (!activeId || settled) return;
-    return watchProjectStatus(activeId, {
-      onStatus: (next) => {
-        setStatus(next);
-        setError(null);
+    if (!activeId) return;
+    setActivity([]);
+    setQuality(null);
+    return subscribeToRun(activeId, {
+      onConnection: (state, detail) => {
+        setConnection(state);
+        setConnectionDetail(detail ?? "");
       },
+      onSnapshot: (snap) => {
+        /* The snapshot mirrors StatusResponse, so the page's existing status
+           rendering keeps working without a second shape to maintain. */
+        setStatus((prev) =>
+          prev
+            ? {
+                ...prev,
+                stage: snap.stage as WorkflowStage,
+                status: snap.status as RunStatus,
+                iteration_count: snap.iterationCount,
+                awaiting_checkpoint_id: snap.awaitingCheckpointId,
+                preview_available: snap.previewAvailable,
+                updated_at: new Date().toISOString(),
+              }
+            : prev,
+        );
+      },
+      onActivity: (entry) =>
+        setActivity((prev) => {
+          /* A node's later event replaces its running row rather than stacking
+             a second one, so the timeline reads as steps, not repeats. */
+          const existing = prev.findIndex((e) => e.id === entry.id);
+          if (existing !== -1) {
+            const next = [...prev];
+            next[existing] = entry;
+            return next;
+          }
+          const done = prev.map((e) =>
+            e.status === "running" ? { ...e, status: "done" as const } : e,
+          );
+          return [...done, entry].slice(-40);
+        }),
+      onQuality: setQuality,
+      onFinished: () => {
+        /* The run settled. Re-read the authoritative record rather than
+           trusting the last event we happened to see. */
+        void refreshStatusOnce();
+        void refreshProjects();
+      },
+    });
+  }, [activeId, refreshProjects]);
+
+  /* RECOVERY, not live updates: one authoritative read when the stream opens,
+     drops, or the page is reloaded. `watchProjectStatus` still exists for a
+     run whose stream could not be established at all. */
+  const refreshStatusOnce = useCallback(async () => {
+    if (!activeId) return;
+    try {
+      setStatus(await getProjectStatus(activeId));
+      setError(null);
+    } catch (cause) {
+      if (isApiError(cause)) setError(cause);
+    }
+  }, [activeId]);
+
+  useEffect(() => {
+    void refreshStatusOnce();
+  }, [refreshStatusOnce]);
+
+  /* If the stream cannot be used at all, fall back to the old poll so the run
+     is still observable. This is the documented fallback, not the default. */
+  useEffect(() => {
+    if (!activeId || settled || connection !== "error") return;
+    return watchProjectStatus(activeId, {
+      onStatus: (next) => setStatus(next),
       onError: setError,
     });
-  }, [activeId, settled]);
+  }, [activeId, settled, connection]);
 
   /* The full projection is only re-read when the run actually moved, so a
      1.5s poll does not pull the whole state document every tick. */
@@ -733,6 +845,7 @@ export function ChatPage() {
 
   function openProject(projectId: string) {
     setActiveId(projectId);
+    syncProjectInUrl(projectId);
     setStatus(null);
     setProject(null);
     setCheckpoint(null);
@@ -743,6 +856,7 @@ export function ChatPage() {
 
   function newProject() {
     setActiveId(null);
+    syncProjectInUrl(null);
     setStatus(null);
     setProject(null);
     setCheckpoint(null);
@@ -770,6 +884,9 @@ export function ChatPage() {
       setLocalPrompt(prompt);
       setDraft("");
       setActiveId(created.project_id);
+      /* So a reload during the run reopens it instead of returning to an
+         empty composer. */
+      syncProjectInUrl(created.project_id);
       void refreshProjects();
     } catch (cause) {
       if (isApiError(cause)) setError(cause);
@@ -987,28 +1104,9 @@ export function ChatPage() {
           )}
         </nav>
 
-        {/* No authentication exists in v1 (`docs/api.md` §1.1), so this names
-            the workspace rather than a signed-in person. */}
-        <div className="flex shrink-0 items-center gap-3 border-t border-border px-5 py-4">
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-card font-mono text-[10px] text-foreground/80">
-            D
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-[13px] text-foreground">
-              Local workspace
-            </span>
-            <span className="block font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
-              No sign-in required
-            </span>
-          </span>
-          <button
-            type="button"
-            aria-label="Settings"
-            className="text-muted-foreground transition-colors hover:text-foreground"
-          >
-            <Settings size={16} />
-          </button>
-        </div>
+        {/* The real signed-in user. Supabase Auth is live, this route is
+            guarded, and `account-badge.tsx` also owns sign-out. */}
+        <AccountBadge />
       </Rail>
 
       {/* ---------- Center: the conversation ---------- */}
@@ -1168,6 +1266,12 @@ export function ChatPage() {
             </p>
           </form>
         </div>
+
+        {/* Below the composer, not at the end of the thread: the composer owns
+            the bottom of a chat surface, and a footer that scrolled up with
+            the messages would read as part of the conversation. `shrink-0`
+            like the composer, so the thread keeps every pixel it can. */}
+        <AppFooterBar current="/chat" className="shrink-0" />
       </div>
 
       {/* ---------- Right rail: run telemetry ---------- */}
@@ -1266,29 +1370,19 @@ export function ChatPage() {
             </div>
           </section>
 
-          <section>
-            <Eyebrow>MCP servers</Eyebrow>
-            <ul className="mt-3 space-y-0.5">
-              {MCP_SERVERS.map((s) => (
-                <li key={s.name} className="flex items-center gap-2.5 py-1.5">
-                  <s.icon size={14} className="shrink-0 text-muted-foreground" />
-                  <span className="min-w-0 flex-1 truncate text-[13px] text-foreground/85">
-                    {s.name}
-                  </span>
-                  <span
-                    aria-hidden="true"
-                    className={cn("size-1.5 shrink-0 rounded-full", TONE_DOT.idle)}
-                  />
-                  <span className="font-mono text-[9px] uppercase tracking-[0.12em] text-muted-foreground">
-                    No status
-                  </span>
-                </li>
-              ))}
-            </ul>
-            <p className="mt-2.5 text-[12px] leading-relaxed text-muted-foreground">
-              The backend exposes no MCP status endpoint yet.
-            </p>
-          </section>
+          {/* Live agent activity, from the AG-UI stream. Every row is a real
+              graph node, tool call, gate or quality result. */}
+          <ActivityTimeline
+            entries={activity}
+            connection={connection}
+            connectionDetail={connectionDetail}
+            quality={quality}
+          />
+
+          {/* Real status, from `GET /api/v1/github/status`, which verifies the
+              credential with an actual call. This replaced a list of intended
+              integrations showing "No status" — there was no endpoint then. */}
+          <GitHubPanel projectId={activeId} />
         </div>
       </Rail>
     </div>

@@ -557,7 +557,7 @@ function IntegrationsCard({ copy, reduced }: { copy: InkFeatures["integrations"]
             </g>
           ))}
           <text x="150" y="112" textAnchor="middle" fontSize="7" fill="var(--ib-faint)" fontFamily="var(--ib-mono)">
-            {on >= 0 ? "syncing · " + (copy.tools[on] ?? "").toLowerCase() : "4 connected"}
+            {on >= 0 ? "syncing · " + (copy.tools[on] ?? "").toLowerCase() : "github live"}
           </text>
         </svg>
         <div style={{ marginTop: "auto" }}>

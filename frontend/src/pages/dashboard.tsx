@@ -87,6 +87,7 @@ import {
 import dashboardPageBg from "@/assets/dashboard-page-bg.jpg";
 import {
   ApiError,
+  CLIENT_ERROR_CODES,
   getProject,
   getProjectStatus,
   isApiError,
@@ -95,6 +96,8 @@ import {
   type RunStatus,
   type WorkflowStage,
 } from "@/lib/api";
+import { AccountBadge } from "@/components/account-badge";
+import { AppFooterBar } from "@/components/app-footer-bar";
 import { Button } from "@/components/ui/button";
 import { cn } from "@/lib/utils";
 
@@ -174,17 +177,6 @@ const PLAN_NAME = "Studio";
  * Account context
  * ------------------------------------------------------------------ */
 
-/**
- * There is no authentication and no user record, so this names the workspace
- * rather than inventing a person. Kept as a prop so a real account can be
- * passed in unchanged once auth exists.
- */
-const ACCOUNT = {
-  name: "Local workspace",
-  email: "No sign-in required",
-  initials: "D",
-};
-
 const NAV_GROUPS = [
   {
     label: "Overview",
@@ -203,7 +195,7 @@ const NAV_GROUPS = [
   {
     label: "Account",
     items: [
-      { icon: Receipt, label: "Billing", href: "/pricing" },
+      { icon: Receipt, label: "Billing", href: "/features#pricing" },
       { icon: Settings, label: "Settings", href: "/dashboard" },
     ],
   },
@@ -293,20 +285,29 @@ function Figure({ children, unit }: { children: ReactNode; unit?: string }) {
 }
 
 /** A failure, in the backend's own words. Never a message composed here. */
-function ErrorNotice({ error }: { error: ApiError }) {
+function ErrorNotice({ error, onRetry }: { error: ApiError; onRetry?: () => void }) {
   return (
     <div
       role="alert"
       className="mb-4 flex items-start gap-2.5 rounded-lg border border-rose-500/40 bg-rose-500/[0.07] px-4 py-3"
     >
       <TriangleAlert size={15} className="mt-0.5 shrink-0 text-rose-400" />
-      <div className="min-w-0">
+      <div className="min-w-0 flex-1">
         <p className="text-[13px] leading-relaxed text-foreground/90">{error.message}</p>
         <p className="mt-1 font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
           {error.code}
           {error.requestId ? ` · ${error.requestId}` : ""}
         </p>
       </div>
+      {onRetry && (
+        <button
+          type="button"
+          onClick={onRetry}
+          className="shrink-0 self-center rounded-md border border-border px-2.5 py-1 font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground transition-colors hover:border-foreground/30 hover:text-foreground"
+        >
+          Retry
+        </button>
+      )}
     </div>
   );
 }
@@ -508,10 +509,12 @@ type ProjectRow = {
  * Page
  * ------------------------------------------------------------------ */
 
-export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT }) {
+export function DashboardPage() {
   const [navOpen, setNavOpen] = useState(false);
   const [rows, setRows] = useState<ProjectRow[] | null>(null);
   const [error, setError] = useState<ApiError | null>(null);
+  /* Bumped to re-run the load effect — that is how Retry works. */
+  const [reloadKey, setReloadKey] = useState(0);
 
   /**
    * One snapshot on mount. This is a review surface, not a live console — the
@@ -521,6 +524,8 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
    */
   useEffect(() => {
     let alive = true;
+    setRows(null);
+    setError(null);
 
     (async () => {
       try {
@@ -564,17 +569,30 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
           setError(null);
         }
       } catch (cause) {
-        if (alive && isApiError(cause)) {
-          setError(cause);
-          setRows([]);
-        }
+        if (!alive) return;
+        /* `rows === null` IS the loading state, so an unrecognised error used
+           to leave the page saying "Reading projects…" forever. */
+        setRows([]);
+        setError(
+          isApiError(cause)
+            ? cause
+            : new ApiError({
+                code: CLIENT_ERROR_CODES.MALFORMED_RESPONSE,
+                message:
+                  cause instanceof Error
+                    ? cause.message
+                    : "The project list could not be read.",
+                status: 0,
+                clientSide: true,
+              }),
+        );
       }
     })();
 
     return () => {
       alive = false;
     };
-  }, []);
+  }, [reloadKey]);
 
   /* ---- Figures with no backend source ---- */
   const remaining = CYCLE.allowance - CYCLE.used;
@@ -698,17 +716,7 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
           ))}
         </nav>
 
-        <div className="flex shrink-0 items-center gap-3 border-t border-border px-5 py-4">
-          <span className="flex size-8 shrink-0 items-center justify-center rounded-full border border-border bg-card font-mono text-[10px] text-foreground/80">
-            {account.initials}
-          </span>
-          <span className="min-w-0 flex-1">
-            <span className="block truncate text-[13px] text-foreground">{account.name}</span>
-            <span className="block truncate text-[11px] text-muted-foreground">
-              {account.email}
-            </span>
-          </span>
-        </div>
+        <AccountBadge />
       </aside>
 
       {/* ---------- Main ---------- */}
@@ -743,7 +751,9 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
 
         <div className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-[1200px] px-4 py-6 sm:px-6 sm:py-8">
-            {error && <ErrorNotice error={error} />}
+            {error && (
+              <ErrorNotice error={error} onRetry={() => setReloadKey((n) => n + 1)} />
+            )}
 
             <div className="grid grid-cols-1 gap-4 lg:grid-cols-[1.55fr_1fr]">
               {/* ----- Left column ----- */}
@@ -856,14 +866,20 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
                           key={p.id}
                           className="flex items-center gap-3 py-2.5 first:pt-0 last:pb-0"
                         >
-                          <span className="min-w-0 flex-1">
-                            <span className="block truncate text-[13px] text-foreground">
+                          {/* Opening a project is the point of listing it.
+                              `?project=` is read by `pages/chat.tsx` on mount. */}
+                          <a
+                            href={`/chat?project=${encodeURIComponent(p.id)}`}
+                            title={`Open ${p.title} in the builder workspace`}
+                            className="group min-w-0 flex-1"
+                          >
+                            <span className="block truncate text-[13px] text-foreground group-hover:text-ember">
                               {p.title}
                             </span>
                             <span className="block font-mono text-[9px] uppercase tracking-[0.14em] text-muted-foreground">
                               {STAGE_LABEL[p.stage]} · {RUN_STATUS_LABEL[p.status]}
                             </span>
-                          </span>
+                          </a>
                           {p.iterations !== null &&
                             p.maxIterations !== null &&
                             p.iterations > 0 && (
@@ -924,7 +940,7 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
                   meta={
                     <span className="inline-flex items-center gap-2">
                       <Unbacked />
-                      <a href="/pricing" className="text-ember hover:underline">
+                      <a href="/features#pricing" className="text-ember hover:underline">
                         Change
                       </a>
                     </span>
@@ -1033,6 +1049,12 @@ export function DashboardPage({ account = ACCOUNT }: { account?: typeof ACCOUNT 
               </div>
             </div>
           </div>
+
+          {/* Inside the scroll container, not pinned to the shell: the shell
+              is `h-screen overflow-hidden` and the left rail is full-height,
+              so a bar pinned across the bottom would cut through it. Here it
+              closes the content column the way a page footer should. */}
+          <AppFooterBar current="/dashboard" />
         </div>
       </div>
     </div>

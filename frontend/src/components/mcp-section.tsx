@@ -56,14 +56,19 @@ export function McpSection() {
           />
           <AnimatedText
             as="p"
-            text="DETROIT-AI connects over the Model Context Protocol (MCP), so the pipeline can act inside the tools you already work in — starting with four servers."
+            text="DETROIT-AI connects over the Model Context Protocol (MCP), so the pipeline can act inside the tools you already work in. GitHub is live; the rest are on the roadmap."
             delay={0.2}
             stagger={0.014}
             className="mt-5 max-w-md text-base leading-relaxed text-foreground/80"
           />
 
+          {/* This read "4 connected MCP servers". Zero were connected and none
+              could be — there was no credential, no route and no executor.
+              Marketing copy that asserts a capability the product does not
+              have is the one claim a landing page must never make, so it now
+              states what is actually shipped and what is planned. */}
           <p className="mt-6 font-mono text-xs uppercase tracking-[0.18em] text-ember">
-            4 connected MCP servers
+            1 integration live · 3 planned
           </p>
           <ul className="mt-4 space-y-4">
             {SERVERS.map((server) => (
