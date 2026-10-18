@@ -65,7 +65,7 @@ checked against the repository or a live run.
 | Chatbot workspace | `/chat` | **built, and connected to the real backend** |
 | Dashboard | `/dashboard` | **built, partly connected** — project/run data is real; every credit and usage figure has **no backend source** and is marked as such in the UI |
 | Product / features | `/features` | **built** (static) |
-| Login | `/login` | **built as a deliberate placeholder** — submits nothing, stores nothing, not linked from the nav |
+| Login | `/login` | **built and wired to Supabase Auth** — real sign-in/sign-up, honours `?next=`; still not linked from the nav |
 | Pricing Page | `/pricing` | **NOT built.** The route currently falls through to the Landing Page |
 
 | Area | Status |
@@ -97,5 +97,5 @@ checked against the repository or a live run.
 | Tables | `public`: 6 application tables, RLS enabled and forced, 14 policies. `langgraph`: the checkpointer's own 4, in a separate schema with no grants to `anon`/`authenticated` |
 | Auth implementation | **backend DONE.** ES256/JWKS verification, caller-identity dependency, owner-scoped service and repository, all 10 project routes protected |
 | Backend DB role | **`detroit_app`** (`NOBYPASSRLS`) for application queries; `postgres` only for migrations and the checkpointer |
-| Frontend auth | **code DONE, not active** — needs `frontend/.env` (see §Manual steps in the integration report) |
+| Frontend auth | **DONE AND ACTIVE** (verified 2026-10-11) — `frontend/.env` present with both `VITE_` keys, gitignored and untracked. Guards, bearer token and sign-out all live |
 | Isolation | verified: 34/34 assertions, two real users, real RLS, over the real HTTP API |

@@ -531,8 +531,19 @@ Do not advance the workflow, do not substitute an agent-only review for it, and
 **Current availability:** Impeccable is **installed** — a Claude Code skill (4.3.1)
 with a CLI (`--version` 4.0.0) whose `detect --json` is the detector. `.impeccable/`
 is optional per-project detector config, NOT an installation marker; earlier docs
-conflated the two. The evaluation stage is still blocked, but on capturing a
-rendered preview for the reviewers. See `docs/design.md` §5.2.
+conflated the two.
+
+**The evaluation stage is NO LONGER BLOCKED** (verified 2026-10-11). All three
+collaborators are wired with real implementations in `backend/main.py`:
+`impeccable_probe=probe_impeccable`, `impeccable_detector=run_detector` and
+`preview_capture=capture_preview`. Verified by running them: the probe reports
+available CLI 4.0.0, a real `detect --json` scan returned findings, and
+Chromium 153 launches for the rendered capture. The binary resolves through
+the Claude Code skill directory, not `PATH`, so `which impeccable` finding
+nothing does **not** mean it is unavailable.
+
+The gate's blocking behaviour is unchanged and still mandatory: if the probe
+ever reports unavailable, STOP and report BLOCKED. See `docs/design.md` §5.2.
 
 Current Impeccable documentation describes deterministic detection for AI-generated frontend anti-patterns, live/browser iteration, design-system artifacts, and hook-based feedback for supported coding harnesses. Use the installed/current project version rather than assuming a fixed rule count or command set.
 
@@ -844,15 +855,21 @@ authority; this table mirrors it.
 | `chatbot_page` (workspace) | `/chat` | **Built, connected to the real backend** |
 | `dashboard_page` | `/dashboard` | **Built, partly connected** — project/run data real; credit/usage figures have no backend source and are marked in the UI |
 | `features_page` | `/features` | **Built** (static) |
-| `login_page` | `/login` | **Built as a placeholder** — submits nothing, stores nothing, not nav-linked |
+| `login_page` | `/login` | **Built and wired to Supabase Auth** — real sign-in/sign-up, honours `?next=`; not nav-linked |
 | `pricing_page` | `/pricing` | **NOT built** — the route falls through to the Landing Page |
 
 `faq_page` and `help_page` are **OUT OF SCOPE**. Do not create, plan, link
 to, or design toward them unless the user explicitly requests them later.
 
-**Authentication will make `/chat` and `/dashboard` protected routes.** Nothing
-of that is implemented; `react-router-dom` is still not installed and `App.tsx`
-uses a temporary `location.pathname` bridge.
+**`/chat` and `/dashboard` ARE protected routes** (verified 2026-10-11).
+`App.tsx` mounts `AuthProvider` and guards both, redirecting an anonymous
+visitor to `/login?next=<path+query>`; `lib/api.ts` attaches the bearer token;
+`components/account-badge.tsx` shows the signed-in user and owns sign-out. The
+earlier text here said none of it was implemented, which is no longer true.
+
+Still true: `react-router-dom` is **not installed**, and `App.tsx` uses the
+documented temporary `location.pathname` bridge. The guard works within that
+bridge by performing a real navigation rather than a router redirect.
 
 Routing approach is specified in `docs/frontend.md`.
 

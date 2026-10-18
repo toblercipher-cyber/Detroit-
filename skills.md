@@ -615,8 +615,12 @@ agent-only review for it.
 **Availability:** Impeccable is **installed** — a Claude Code skill (4.3.1) with a
 CLI (`--version` 4.0.0); `impeccable detect --json <target>` is the detector.
 `.impeccable/` is optional per-project detector config, not an installation marker.
-The evaluation stage is still blocked, but on capturing a **rendered** preview for
-the reviewers, not on Impeccable. See `docs/design.md` §5.2.
+**The evaluation stage is NO LONGER BLOCKED** (verified 2026-10-11). The detector and the
+rendered-preview capture are both wired in `backend/main.py` and both were run:
+a real `detect --json` scan returned findings, and Chromium 153 launches for the
+capture. Note the binary resolves via the Claude Code skill directory, not
+`PATH`. The blocking rule itself still stands: an unavailable probe means STOP
+and report BLOCKED. See `docs/design.md` §5.2.
 
 Use Impeccable as an automated design-quality signal.
 

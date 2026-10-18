@@ -22,7 +22,35 @@ connected.** Requirement analysis, planning, design, reference analysis, build,
 preview and evaluation must never depend on an MCP server being present. MCP adds
 optional capability at the edges.
 
-**No MCP server is connected in v1.** Connecting one requires explicit user approval.
+**No MCP server is connected by default.** Connecting one requires explicit user
+approval and `MCP_GITHUB_SERVER_URL`.
+
+### GitHub is implemented (implemented 2026-10-11)
+
+GitHub integration ships, and it does NOT depend on an MCP server:
+
+| Capability | Path | Status |
+|---|---|---|
+| status, repository listing, selection | REST adapter | implemented |
+| push (workspace `src/` -> a branch) | REST adapter | implemented |
+| pull / import | — | **removed, out of scope** |
+| repository creation, PRs, issues | — | not implemented |
+| arbitrary discovered tools | MCP + GitHub Operator | implemented, **dormant** until a server is configured |
+
+**MCP capability is verified, not assumed.** When `MCP_GITHUB_SERVER_URL` is
+set, `GitHubGateway.probe_mcp` connects and lists what the server actually
+advertises, and `GET /api/v1/github/status` reports the count and how many are
+write-capable. An unreachable server reports that it could not be reached — it
+never reports a capability it did not observe.
+
+**Why push does not go through MCP.** Section 4 forbids assuming tool
+names, and discovery returns names and schemas but never MEANING — nothing in
+code can know which of `push_files`, `create_commit` or `repo_write` commits a
+tree. A deterministic sync cannot be built on that, so it uses the REST adapter
+(`backend/tools/github_rest.py`). MCP remains the path for the **GitHub
+Operator agent**, which is a model and *can* read a discovered tool's
+description and choose. `backend/services/github_gateway.py` records this
+decision in full.
 
 ## 2. Integrations
 

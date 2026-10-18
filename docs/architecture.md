@@ -214,13 +214,37 @@ Every step is:
 - run with a minimal environment — no builder secrets are inherited
 - captured with output **sanitized** before it reaches state or the API
 
+### 5.3a GitHub synchronisation (implemented 2026-10-11)
+
+```text
+workspace/src/   ->  GitHub branch   (REST adapter, approval-gated, push only)
+```
+
+`backend/services/github_gateway.py` owns it; `backend/tools/github_rest.py`
+is the transport. Push builds ONE commit through the Git Data API —
+blobs → tree → commit → ref — so a generated project lands atomically instead
+of as dozens of per-file commits. The ref moves without force.
+
+MCP is a separate path, used by the **GitHub Operator agent** rather than by
+the sync, because discovered tool names carry no meaning that deterministic
+code can rely on (`docs/mcp.md` §2.1).
+
 ### 5.4 How preview is produced
 
 **v1 serves a static build, not a dev server.**
 
 ```text
-workspace/dist/  ->  GET /preview/{project_id}/...  (static, read-only)
+workspace/dist/  ->  GET /preview/{token}/...  (static, read-only)
 ```
+
+The first path segment is a **signed five-minute capability token**, not a
+project id. The static route cannot authenticate a caller — a browser tab or an
+iframe sends no `Authorization` header — so the authorization travels in the
+URL. It is minted only by the owner-scoped
+`GET /api/v1/projects/{id}/preview`. Relative asset URLs keep working because
+the generated project is built with `base: "./"`, so every sub-resource
+inherits the token prefix automatically. See `docs/security.md` §9.1 and
+`docs/api.md` §2.5.
 
 Rationale: a per-project long-lived dev server would mean N model-driven processes
 holding ports with HMR and a plugin pipeline. A one-shot build plus static serving has
@@ -229,7 +253,9 @@ a much smaller attack surface and is enough for review-and-iterate.
 Serving rules:
 
 - Read-only. Paths resolve inside `workspace/dist/` only; traversal returns `404`.
-- Served with `X-Content-Type-Options: nosniff` and a restrictive CSP.
+- A valid token is required, and ownership is re-checked on every request.
+- Served with `X-Content-Type-Options: nosniff` and a restrictive CSP whose
+  `frame-ancestors` comes from the CORS allowlist — never `*`.
 - Rendered in a **sandboxed iframe** on the Chatbot Page.
 - `preview_status` is `stale` when files changed after the last successful build.
 

@@ -45,6 +45,17 @@ history.
 
   The service-role key is read by nothing today and must not be used to serve a
   user-facing read that RLS could serve instead (§7, least privilege).
+- **`GITHUB_TOKEN` is a secret.** It is a `SecretStr`, read only when an auth
+  header is built, and never logged, never returned by a route, and never
+  placed in agent context (`docs/mcp.md` §6). `GITHUB_API_BASE_URL` and
+  `MCP_GITHUB_SERVER_URL` are validated as **https-only** (localhost excepted)
+  because the token is sent to both as a bearer credential; over plain http
+  that is credential disclosure, not a connectivity problem.
+- **`PREVIEW_URL_SECRET` is a secret** and signs preview URLs (§9.1). Forging
+  that signature means reading any user's generated site, so it is declared as
+  `SecretStr`, is required in multi-user mode, and is never logged. Preview
+  **URLs** are themselves credentials for their five-minute lifetime: never log
+  one, never put one in an error message.
 - **A password inside a DSN must be percent-encoded.** `@`, `"`, `]` and friends
   are reserved in a URI; left raw they break the parser and, worse, can silently
   shift where the host boundary is read.
@@ -184,20 +195,65 @@ Repository operations are never an implicit side effect of generation.
 
 ## 9. Network Exposure
 
-**Authentication is decided (Supabase Auth, `docs/database.md` §1.3) but NOT
-IMPLEMENTED.** Until it is, every constraint below stands unchanged:
+**Authentication is IMPLEMENTED** (Supabase Auth, `docs/database.md` §1.3).
+Access tokens are verified ES256 against the published JWKS, every project
+route is owner-scoped from the verified token, RLS is enabled and forced, and
+the backend connects as `detroit_app` (`NOBYPASSRLS`). The three conditions
+this section previously set for lifting the loopback binding are met.
 
-- bind to `127.0.0.1` only
-- CORS restricted to an explicit origin allowlist (the Vite dev origin)
-- **do not expose this server publicly in its current state** — a `project_id` alone
-  grants read and mutate access to that project
+Standing constraints regardless:
 
-These are consequences of there being no auth, not permanent rules. Lifting the
-loopback binding requires **all three** of: `docs/api.md` §1.1 implemented
-(token verified, routes owner-scoped), RLS enabled on every `public` table, and
-`docs/database.md` §5.2 #7 resolved. Doing one or two of the three produces a
-system that looks protected and is not — the backend currently connects as a
-superuser, which ignores RLS entirely.
+- bind to `127.0.0.1` by default
+- CORS restricted to an explicit origin allowlist; `allow_credentials=False`,
+  because the session travels in an `Authorization` header and not a cookie
+- a `project_id` alone grants nothing — identity comes from the token and from
+  nowhere else (`docs/api.md` §1.1)
+
+### 9.2 GitHub writes
+
+Every repository write is approval-gated and bounded:
+
+| Control | Rule |
+|---|---|
+| Approval | two-phase; execution without a single-use token is `403`, a spent one `410` |
+| Scope | only `src/` travels, in either direction |
+| Deletion | not implemented — the commit is additive, `base_tree` preserved |
+| Force | never; the ref update sets `force: false`, so a moved branch is a conflict |
+| History rewrite | not implemented, and the GitHub Operator is forbidden from proposing one |
+| Import | not implemented — pull/import was removed; nothing writes into a workspace from a remote |
+| Paths | validated against traversal before becoming a URL segment or a local write |
+| Ownership | every project route is owner-scoped; another user's project is `404` |
+
+### 9.1 Preview URLs carry their own authorization
+
+The static `/preview/...` route is the one surface that cannot use the bearer
+token: a browser tab or an iframe issues a plain GET and cannot attach a
+header. It previously had **no access control at all**, which was a verified
+cross-user leak — a probe read user A's built `index.html` as user B, and
+unauthenticated, receiving `200` and A's content both times.
+
+It is now addressed by a signed capability instead of a project id:
+
+| Control | Rule |
+|---|---|
+| Token | HS256, `algorithms` **pinned** on verify; all claims required |
+| Issuance | only from the owner-scoped `GET /api/v1/projects/{id}/preview` |
+| TTL | 5 minutes |
+| Scope | one project's `dist/` subtree — never a wider path, never another project |
+| Ownership | re-checked against current state on **every** request, so a token does not outlive a deletion or ownership change |
+| Containment | `dist/` path resolution still applies independently (§3.4) |
+| Failure | a bare `404` for every cause; expired, forged and traversal are indistinguishable |
+| Key | `PREVIEW_URL_SECRET`; **startup fails** without it when `DATABASE_URL_APP` is set. A process-local key is generated only in single-user development, with a warning |
+
+`frame-ancestors` is built from the CORS allowlist so the workspace can embed a
+preview. It is **never** `*`, and an empty allowlist falls back to `'none'` —
+an unconfigured allowlist must not silently mean "anybody may frame this".
+
+Residual risk, accepted: a preview URL is a bearer capability for up to five
+minutes, so anyone it leaks to can read that build. `Referrer-Policy:
+no-referrer` and `Cache-Control: no-store` are set, the token is never logged,
+and the TTL is the bound. There is no revocation before expiry; at five
+minutes a `jti` denylist would add shared state for negligible gain.
 
 ## 10. Logging
 

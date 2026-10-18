@@ -139,8 +139,92 @@ Never echo the API key or any secret value. `model_configured` is a boolean only
 | `GET` | `/api/v1/projects/{project_id}/files/{file_path:path}` | — | file content | 200, 404 |
 
 - `409` on `/preview` when no successful build exists yet.
+
+**The preview URL carries a signed, short-lived capability.**
+`PreviewResponse.preview_url` is `/preview/{token}/`, **not**
+`/preview/{project_id}/`. The static route cannot authenticate anyone — a
+browser tab or an iframe issues a plain GET and cannot attach an
+`Authorization` header — so the right to read a project's built output travels
+in the URL instead:
+
+| Property | Value |
+|---|---|
+| Algorithm | HS256, **pinned** on verify (`backend/auth/preview_token.py`) |
+| Signing key | `PREVIEW_URL_SECRET`; **required** when `DATABASE_URL_APP` is set, and startup fails without it |
+| TTL | 5 minutes; `expires_at` is returned alongside |
+| Claims | `pid`, `sub`, `scope`, `exp`, `iat`, `nbf`, `jti` — all required |
+| Scope | one project's `dist/` subtree, not a single file |
+
+Issuance happens only on this owner-scoped route, so a token is never minted
+for a project the caller does not own. Every request to `/preview/{token}/...`
+then re-checks that the project still exists and is still owned by `sub`, so a
+token does not outlive a deletion or an ownership change.
+
+Three independent controls, none of which replaces another: token validity,
+the ownership re-check, and path containment within `dist/`
+(`docs/security.md` §3.4). **Every failure returns a bare `404`** — expired,
+forged, another user's, traversal and missing file are indistinguishable to a
+caller.
+
+The URL is a credential. Clients must not cache, log or share it, and should
+re-request this endpoint rather than storing the string.
+
+> **This closes a verified cross-user leak.** `/preview/{project_id}/*`
+> previously had no authentication at all: a probe read user A's built
+> `index.html` as user B, and with no credentials, receiving `200` and A's
+> content both times. Old `/preview/{project_id}/...` URLs now `404`.
 - `file_path` is resolved against the project workspace and must stay inside it
   (`docs/security.md` §3.4). Traversal attempts return `404`, never the file.
+
+### 2.5a GitHub integration (implemented 2026-10-11)
+
+| Method | Path | Request | Response | Codes |
+|---|---|---|---|---|
+| `GET` | `/api/v1/github/status` | — | `GitHubStatusResponse` | 200, 401 |
+| `GET` | `/api/v1/github/repositories` | — | `RepositoryList` | 200, 401, 501, 502 |
+| `GET` | `/api/v1/projects/{id}/github` | — | `GitHubLinkResponse` | 200, 401, 404 |
+| `PUT` | `/api/v1/projects/{id}/github` | `SelectRepositoryRequest` | `GitHubLinkResponse` | 200, 401, 404, 409, 501 |
+| `DELETE` | `/api/v1/projects/{id}/github` | — | — | 204, 401, 404 |
+| `POST` | `/api/v1/projects/{id}/github/push/preview` | — | `SyncPlanResponse` | 200, 401, 404, 409, 501 |
+| `POST` | `/api/v1/projects/{id}/github/push` | `ExecuteSyncRequest` | `SyncResultResponse` | 200, 401, 403, 404, 409, 410, 502 |
+
+**The user supplies a URL.** `SelectRepositoryRequest.repository` accepts a
+GitHub URL (`https://github.com/owner/repo`, with or without `.git`, a trailing
+slash, a deeper path such as `/tree/main`, or a query), an SSH clone string
+(`git@github.com:owner/repo.git`, `ssh://…`), a bare `github.com/owner/repo`,
+or plain `owner/repo`. All reduce to two segments validated against GitHub's
+naming rules; traversal is refused. Selection **verifies that the repository
+exists and that the credential can push to it** before storing anything, so a
+read-only repository is rejected at connect time rather than at first push.
+
+**Scope.** Pushing a generated project into the user's existing repository is
+the ONLY sync operation. DETROIT never creates a repository. Pull/import and
+pull-request creation were implemented and then **removed** as out of scope —
+re-adding either means re-adding its approval path and its tests deliberately.
+
+**Two-phase, like every external write.** `*/preview` mutates nothing and
+returns a plan plus a single-use, short-TTL `approval_token`. `*/push` and
+`*/pull` refuse without it: `403 approval_required` for an invalid token,
+`410 approval_expired` for one already spent or past its TTL. An approval is
+bound to its project and never generalises to another.
+
+**What push synchronises.** Only `src/`.
+
+| | Push |
+|---|---|
+| Direction | workspace `src/` → branch |
+| Outside `src/` | not sent — the rest is the frozen template and build output |
+| Deletions | never — the commit is additive (`base_tree` preserved) |
+| History | never rewritten; the ref moves **without force** |
+| Conflict | branch moved since the plan → `409`, never an overwrite |
+| Unsupported | non-UTF-8 and oversized files skipped, each with a reason |
+
+`SyncChange.kind` is `add`, `update` or `skip`. There is no `conflict` or
+`unchanged` kind: both belonged to the removed pull path.
+
+**No credential is ever returned.** `GitHubStatusResponse` carries booleans and
+an account name. `configured` is verified by a real call, so a revoked or
+wrong-scoped token reports `false` rather than "connected".
 
 ### 2.6 Evaluation
 
@@ -367,9 +451,10 @@ BuildStatusResponse
   error: ErrorBody?             # sanitized build failure summary
 
 PreviewResponse
-  preview_url: str              # "/preview/{project_id}/"
+  preview_url: str              # "/preview/{token}/" — signed, 5-minute capability
   built_at: datetime
   status: "fresh" | "stale"     # stale = files changed since the last build
+  expires_at: datetime          # when preview_url stops working
 
 GeneratedFileManifest
   files: FileRef[]

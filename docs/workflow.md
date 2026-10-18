@@ -78,9 +78,12 @@ enter Evaluation
 An agent-only review may add interpretation on top of Impeccable findings. It may
 never stand in for them, and a blocked gate is never reported as a pass.
 
-**Current status: Impeccable IS installed** (skill 4.3.1, CLI 4.0.0). The stage is
-still blocked, but on capturing a **rendered** preview for the reviewers, not on
-the detector (`docs/design.md` §5.2).
+**Current status: the stage is RUNNABLE** (verified 2026-10-11). Impeccable is installed
+(skill 4.3.1, CLI 4.0.0) and `backend/main.py` injects the real
+`impeccable_detector` and `preview_capture`, so neither half of the gate is
+stubbed. Confirmed by executing both: a `detect --json` scan returned findings
+and Chromium 153 launched. The `unavailable -> blocked` branch above remains in
+force; it is simply not the current state.
 
 ## 2. Adaptive HITL
 
@@ -176,6 +179,25 @@ User feedback
 
 Do not regenerate the whole project unless the user explicitly asks or the change
 genuinely requires it. Preserve every unrelated approved decision.
+
+## 5a. External Action (implemented 2026-10-11)
+
+`external_action` is a **user-initiated** stage, not an automatic one. It has
+no node in the LangGraph pipeline, and that is deliberate: `skills.md` §21 says
+repository operations are never an implicit side effect of generation. A build
+finishing does not push anything.
+
+```text
+build complete
+  -> user connects a repository        PUT  /projects/{id}/github
+  -> user asks to push                 POST .../push/preview        (no mutation)
+  -> user reads the file-level plan
+  -> user approves                     POST .../push                (token spent)
+  -> outcome recorded in mcp_action_history
+```
+
+The approval gate is `backend/services/external_actions.py` and is the same one
+every external write uses (`docs/mcp.md` §5).
 
 ## 6. Stop Conditions
 

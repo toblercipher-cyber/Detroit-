@@ -13,28 +13,34 @@ original three routes; each addition was a direct user request.
 | Chatbot workspace | `/chat` | **Built and connected to the real backend** |
 | Dashboard | `/dashboard` | **Built, partly connected.** Project/run data is real; every credit and usage figure has no backend source and is chipped as such in the UI |
 | Product / features | `/features` | **Built** (static) |
-| Login | `/login` | **Built as a deliberate placeholder.** Submits nothing, stores nothing, and is **not linked from the nav** — linking it would advertise an account system that does not exist yet |
+| Login | `/login` | **Built and wired to Supabase Auth.** Real sign-in/sign-up; honours `?next=`. Still **not linked from the nav** — now a UX choice, not an honesty one |
 | Pricing Page | `/pricing` | **NOT built.** The route falls through to the Landing Page. The pricing UI exists as `components/pricing-tiers.tsx`, rendered inside `/features` |
 
 **FAQ and Help pages are OUT OF SCOPE.** Do not create them, plan for them,
 link to them, or reserve navigation space for them unless the user explicitly
 requests them later.
 
-### 1.1 Authentication is coming to this layer
+### 1.1 Authentication is IMPLEMENTED in this layer
 
-DETROIT is now an authenticated multi-user product (`docs/database.md` §1.3).
-Consequences for the frontend, **none of them implemented yet**:
+DETROIT is an authenticated multi-user product (`docs/database.md` §1.3). This
+section previously listed the consequences as "none of them implemented yet".
+All of them are now done (verified 2026-10-11):
 
-- `/login` gets wired to **Supabase Auth** and its "preview only" notices come out.
-- `/chat` and `/dashboard` become **protected routes** and need a guard plus a
-  session provider.
-- `frontend/src/lib/api.ts` attaches `Authorization: Bearer <jwt>` to every
-  request. It is the only file that touches transport, so this is a one-place
-  change.
-- The frontend uses **`SUPABASE_PUBLISHABLE_KEY` only**. The service-role key
-  and `DATABASE_URL` must never reach a bundle (`docs/database.md` §1.3.4).
-- The account blocks in `/chat` and `/dashboard`, currently reading "Local
-  workspace / No sign-in required", show the real signed-in user.
+| Consequence | Where | Status |
+|---|---|---|
+| `/login` wired to Supabase Auth | `pages/login.tsx`, `components/ui/auth-ui.tsx` | **done** — real `signIn`/`signUp`, honours `?next=` with same-site validation |
+| `/chat` and `/dashboard` are protected | `App.tsx` `Guarded` + `AuthProvider` | **done** — `loading` handled separately from `anonymous`, so a refresh does not bounce a signed-in user |
+| Bearer token on every request | `lib/api.ts` | **done** — token read per request, so an idle tab refreshes rather than sending a stale one |
+| Publishable key only | `lib/auth.tsx` | **done** — a service-role key is *refused at startup*, loudly |
+| Real signed-in user in the account blocks | `components/account-badge.tsx` | **done** — shared by both surfaces, and owns sign-out |
+
+`frontend/.env` must hold `VITE_SUPABASE_URL` and
+`VITE_SUPABASE_PUBLISHABLE_KEY`; it is gitignored and untracked. Without it the
+module reports `unconfigured` and the app still renders — a missing variable
+must not look like a broken build.
+
+**Not verified in a browser:** the signed-in rendering of `/dashboard` and
+`/chat`. That requires signing in to Supabase, a remote identity provider.
 
 ## 2. Existing Stack (do not change without approval)
 

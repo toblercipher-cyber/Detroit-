@@ -250,7 +250,14 @@ Rules applying to all roles:
 - **Output** — `FixResult { findings_addressed[], files_modified[], unresolved[],
   escalated_to_user[] }`
 
-### 4.12 GitHub Operator *(gated)*
+### 4.12 GitHub Operator *(gated)* — implemented 2026-10-11
+
+Implemented in `backend/agents/github_operator.py`. It PROPOSES tool calls and
+never performs them: its output is an `ExternalActionProposal`, and four
+independent checks in `McpClient.call_tool` stand between that output and any
+call (discovered · role · approved · schema-valid). It needs a connected MCP
+server; push and pull do not go through it (`docs/mcp.md` §2.1).
+
 
 - **Purpose** — perform approved repository operations through MCP.
 - **Responsibilities** — discover actual server capabilities before use; produce a
