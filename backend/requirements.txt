@@ -85,6 +85,24 @@ langchain-anthropic==1.7.2
 # definition to keep in sync with the Pydantic models (CLAUDE.md 9A).
 psycopg[binary,pool]==3.3.6
 
+# --- Authentication (docs/database.md 1.3.5, docs/security.md 9) ------------
+# Verifies Supabase access tokens (ES256 over a published JWKS) in
+# backend/auth/jwt.py, and signs the short-lived preview URLs in
+# backend/auth/preview_token.py (HS256, symmetric -- this server is both
+# issuer and verifier there).
+#
+# This was previously listed under DEFERRED as "REQUIRED, NOT YET ADDED". The
+# auth implementation has since landed and `import jwt` runs at startup, so a
+# fresh install from this file could not start the backend at all. The [crypto]
+# extra is what provides asymmetric algorithms; without it ES256 verification
+# raises at runtime rather than at install time.
+PyJWT[crypto]==2.15.1
+
+# Pulled in by PyJWT[crypto], and pinned explicitly for the same reason every
+# other version here is: an unpinned transitive dependency changes the
+# installed tree without anyone deciding it did.
+cryptography==50.0.2
+
 # --- Outbound HTTP ----------------------------------------------------------
 # Used where the backend must make its own HTTP calls. Also the transport the
 # above libraries already rely on; pinned here so the version is explicit rather
@@ -137,14 +155,6 @@ pytest==9.1.1
 #                    Auth admin API -- none of which v1 uses. Supabase Auth is
 #                    verified by JWT, not by an SDK (docs/database.md 1.3.5).
 #       Unblocked by: a requirement that actually needs one of those three.
-#
-#   JWT verification library (PyJWT[crypto] / joserfc)
-#       Status:      REQUIRED for authentication, NOT YET ADDED.
-#       Why:         The Supabase project signs access tokens with ES256 and
-#                    publishes a JWKS, so verification needs an asymmetric-capable
-#                    library. There is no shared secret to compare against, and
-#                    SUPABASE_JWT_SECRET must not be introduced.
-#       Unblocked by: the auth implementation step.
 #
 #   Migration tool (Alembic or similar)
 #       Status:      NOT CHOSEN. Plain SQL files under backend/db/migrations/

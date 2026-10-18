@@ -215,6 +215,13 @@ print("=== 7. Raw LangGraph errors never escape ===")
 
 
 class Boom:
+    # The service drives the graph with `astream` now (it needs per-node
+    # updates for the AG-UI timeline), so a double for a FAILING graph has to
+    # fail there. `ainvoke` is kept because it is still the real graph's API
+    # and a double that silently lacks it would hide a wiring mistake.
+    def astream(self, *a, **k):
+        raise RuntimeError("the graph exploded: secret internal detail")
+
     async def ainvoke(self, *a, **k):
         raise RuntimeError("internal node C:/secret/path exploded")
 

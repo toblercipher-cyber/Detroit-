@@ -18,7 +18,22 @@ WHY A STATIC BUILD AND NOT A DEV SERVER
     and is enough to review and iterate.
 
 WHAT THIS IS DEFENDING AGAINST
-    Every byte here originated from a model. Three separate controls apply:
+    Two different problems, and they need different controls.
+
+    First, WHO may read a project's output. Until this route required a token,
+    the answer was "anyone who knows a project id", verified as a real
+    cross-user leak. Now a signed five-minute capability token stands in the
+    path where the project id used to be, and ownership is re-checked against
+    current state on every request (see ``serve_preview``).
+
+    Note the degenerate case: in single-user development there is no
+    application database, ``for_owner`` has nobody to scope to, and the
+    ownership re-check reduces to "this project exists". That is correct when
+    there is exactly one user, and it is why ``main.py`` refuses to start in
+    multi-user mode without a configured signing key.
+
+    Second, WHAT the bytes may do once served. Every one of them originated
+    from a model, so three further controls apply:
 
     - **Containment.** The requested path is resolved and confirmed to sit inside
       this project's ``dist/`` before anything is opened. Traversal returns 404,
@@ -41,11 +56,16 @@ Spec: docs/architecture.md 5.4; docs/api.md 2.5; docs/security.md 3.4, 4.
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from pathlib import Path
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import FileResponse
 
+from backend.api.deps import get_preview_secret
+from backend.auth import preview_token
+from backend.auth.preview_token import PreviewTokenError
 from backend.memory.artifacts import InvalidProjectIdError, ProjectNotFoundError
 from backend.services.projects import ProjectService
 
@@ -92,29 +112,67 @@ _CONTENT_TYPES: dict[str, str] = {
 # generated markup — does not execute.
 #
 # connect-src 'none' stops a generated page exfiltrating anything it was told to.
-# frame-ancestors 'self' lets the Chatbot page embed it while nobody else can.
-_CSP = "; ".join(
-    (
-        "default-src 'none'",
-        "script-src 'self'",
-        "style-src 'self' 'unsafe-inline'",
-        "img-src 'self' data:",
-        "font-src 'self' data:",
-        "connect-src 'none'",
-        "form-action 'none'",
-        "base-uri 'none'",
-        "frame-ancestors 'self'",
-    )
+_CSP_DIRECTIVES = (
+    "default-src 'none'",
+    "script-src 'self'",
+    "style-src 'self' 'unsafe-inline'",
+    "img-src 'self' data:",
+    "font-src 'self' data:",
+    "connect-src 'none'",
+    "form-action 'none'",
+    "base-uri 'none'",
 )
 
+
+def _csp(allowed_origins: Sequence[str]) -> str:
+    """The preview CSP, with ``frame-ancestors`` built from the CORS allowlist.
+
+    WHY THIS IS NOT A CONSTANT ANY MORE
+        It used to end ``frame-ancestors 'self'``, and the comment claimed that
+        let the Chatbot page embed the preview. It did not. ``'self'`` is the
+        origin serving THIS response -- the backend on :8000 -- while the app
+        runs on :5173, so the browser blocked the only embed anyone wanted.
+
+        The frontend origins are already enumerated for CORS, and they are the
+        same origins entitled to frame a preview, so that list is reused rather
+        than a second one invented and left to drift.
+
+    NEVER A WILDCARD
+        ``frame-ancestors *`` would let any site on the internet frame a
+        preview and attempt clickjacking against it. The value is always the
+        explicit allowlist. If that list is somehow empty, this falls back to
+        ``'none'`` -- refusing all framing -- because an empty allowlist must
+        not silently mean "anyone".
+
+        The exposure this does add is bounded: a framed preview is the user's
+        own static output, with ``connect-src 'none'`` and ``form-action
+        'none'``, so there is no credentialed action inside it to hijack.
+    """
+    origins = [origin for origin in allowed_origins if origin and origin != "*"]
+    ancestors = " ".join(origins) if origins else "'none'"
+    return "; ".join((*_CSP_DIRECTIVES, f"frame-ancestors {ancestors}"))
+
+# Everything except the CSP, which depends on configuration and is added per
+# response by `_headers_for` below.
 _SECURITY_HEADERS: dict[str, str] = {
-    "Content-Security-Policy": _CSP,
     "X-Content-Type-Options": "nosniff",
     "Referrer-Policy": "no-referrer",
     # The preview is regenerated on every build and must never be served from a
     # cache after a rebuild, or a user reviews the previous version.
     "Cache-Control": "no-store",
 }
+
+
+def _headers_for(request: Request) -> dict[str, str]:
+    """The static headers plus a CSP built from this server's CORS allowlist.
+
+    Settings are read from application state rather than ``get_settings()`` so
+    a test that builds an app with a different allowlist gets that allowlist,
+    not a cached process-wide one.
+    """
+    settings = getattr(request.app.state, "settings", None)
+    origins = getattr(settings, "allowed_origins", ()) if settings else ()
+    return {**_SECURITY_HEADERS, "Content-Security-Policy": _csp(origins)}
 
 
 def get_project_service(request: Request) -> ProjectService:
@@ -183,21 +241,69 @@ def resolve_preview_file(dist_dir: Path, relative_path: str) -> Path:
     return candidate
 
 
-@router.get("/{project_id}", include_in_schema=False)
-@router.get("/{project_id}/{file_path:path}")
+@router.get("/{token}", include_in_schema=False)
+@router.get("/{token}/{file_path:path}")
 async def serve_preview(
-    project_id: str,
+    token: str,
+    request: Request,
     file_path: str = "",
     service: ProjectService = Depends(get_project_service),
+    preview_secret: str = Depends(get_preview_secret),
 ) -> FileResponse:
-    """Serve one file from this project's built output.
+    """Serve one file from a project's built output, against a signed token.
 
     Read-only by construction: the router declares GET alone, so there is no
     write path to secure.
+
+    WHY THE FIRST SEGMENT IS A TOKEN AND NOT A PROJECT ID
+        It used to be a project id, with no authentication of any kind, and
+        that was a cross-user data leak: a probe fetched user A's built
+        ``index.html`` as user B and with no credentials at all, receiving 200
+        and A's content both times.
+
+        It cannot simply require a bearer token instead, because nothing that
+        loads a preview can send one — a browser tab and an iframe both issue
+        plain GETs. So the capability travels in the path, signed and
+        five-minute-lived, minted only by the owner-scoped
+        ``GET /api/v1/projects/{id}/preview``
+        (``backend/auth/preview_token.py`` explains the design).
+
+        Old ``/preview/{project_id}/...`` URLs now fail verification and 404,
+        which is the intended outcome rather than a migration oversight.
+
+    THREE CHECKS, NONE OF WHICH SUBSTITUTES FOR ANOTHER
+        1. The token verifies: our signature, unexpired, right scope.
+        2. The project still exists AND is still owned by the token's subject.
+           Without this a token would outlive a deletion or an ownership
+           change for the remainder of its TTL.
+        3. The resolved path stays inside this project's ``dist/``
+           (``resolve_preview_file``, unchanged and already adversarial).
+
+        Every failure returns the same bare 404.
     """
     try:
-        workspace = service.workspace_dir(project_id)
-    except (ProjectNotFoundError, InvalidProjectIdError):
+        grant = preview_token.verify(token, secret=preview_secret)
+    except PreviewTokenError as exc:
+        # The token itself is never logged: it IS the credential, and this log
+        # line is the one place it would otherwise land (docs/security.md 2, 10).
+        logger.info("rejected preview token: %s", exc)
+        raise _not_found() from None
+
+    project_id = grant.project_id
+
+    # Re-check ownership against CURRENT state rather than trusting the claim.
+    # `for_owner` binds the repository to the token's subject, so a project the
+    # subject no longer owns -- or that has since been deleted -- raises
+    # ProjectNotFoundError here instead of being served.
+    #
+    # ValueError covers a `sub` that is not a UUID at all, which a valid
+    # signature does not rule out.
+    try:
+        scoped = service.for_owner(UUID(grant.owner_id))
+        scoped.get(project_id)
+        workspace = scoped.workspace_dir(project_id)
+    except (ProjectNotFoundError, InvalidProjectIdError, ValueError):
+        logger.info("preview token no longer authorizes its project jti=%s", grant.jti)
         raise _not_found() from None
 
     dist_dir = workspace / PREVIEW_DIR
@@ -211,5 +317,5 @@ async def serve_preview(
     return FileResponse(
         target,
         media_type=_CONTENT_TYPES[target.suffix.lower()],
-        headers=_SECURITY_HEADERS,
+        headers=_headers_for(request),
     )

@@ -101,6 +101,9 @@ _JSON_COLUMNS = (
     "evaluation_results",
     "pending_checkpoint",
     "last_error",
+    # The connected GitHub repository (migration 0003). Nullable: most
+    # projects never connect one.
+    "github",
 )
 # Always present on the model, therefore NOT NULL in the table.
 _JSON_REQUIRED = ("build_status", "preview_status")

@@ -45,6 +45,8 @@ Spec: docs/api.md 2.2, 5; docs/architecture.md 3.2; docs/security.md 3.4.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 from fastapi import (
     APIRouter,
     BackgroundTasks,
@@ -57,7 +59,14 @@ from fastapi import (
 )
 from fastapi.responses import Response
 
-from backend.api.deps import get_project_service, get_scoped_service
+from backend.api.deps import (
+    get_caller,
+    get_preview_secret,
+    get_project_service,
+    get_scoped_service,
+)
+from backend.auth import preview_token
+from backend.auth.jwt import CallerIdentity
 from backend.memory.artifacts import InvalidProjectIdError, ProjectNotFoundError
 from backend.schemas.api import (
     CreateProjectRequest,
@@ -145,6 +154,8 @@ async def list_projects(
                 stage=state.current_stage,
                 status=state.run_status,
                 updated_at=state.updated_at,
+                created_at=state.created_at,
+                iteration_count=state.iteration_count,
             )
             for state in service.list_summaries()
         ]
@@ -193,6 +204,8 @@ async def get_project_status(
 async def get_preview(
     project_id: str,
     service: ProjectService = Depends(get_scoped_service),
+    caller: CallerIdentity = Depends(get_caller),
+    preview_secret: str = Depends(get_preview_secret),
 ) -> PreviewResponse:
     """Where this project's built output can be viewed, and how current it is.
 
@@ -204,6 +217,21 @@ async def get_preview(
     409 rather than 404 when nothing has been built: the project exists, and
     "not yet" is a different situation from "no such project" — the client
     should keep polling, not give up (docs/api.md 2.5).
+
+    THIS ROUTE IS THE ONLY PLACE A PREVIEW TOKEN IS MINTED
+        The static ``/preview`` router has no way to authenticate anyone: a
+        browser tab or an iframe sends no ``Authorization`` header. So the
+        right to read this project's output is granted HERE, where the caller
+        is already verified and ``service`` is already owner-scoped, and is
+        then carried by a signed five-minute token in the returned URL
+        (``backend/auth/preview_token.py``).
+
+        ``_load`` above is what makes the grant safe to issue: on the
+        owner-scoped service it raises ``ProjectNotFoundError`` for a project
+        the caller does not own, so a token is never minted for someone else's
+        project. The token records ``caller.user_id`` so the static route can
+        re-check ownership on every request rather than trusting the signature
+        to still reflect reality.
     """
     state = _load(service, project_id)
     preview = state.preview_status
@@ -219,10 +247,19 @@ async def get_preview(
         error.code = ErrorCode.PREVIEW_NOT_AVAILABLE
         raise error
 
+    token, expires_at = preview_token.issue(
+        project_id=project_id,
+        owner_id=str(caller.user_id),
+        secret=preview_secret,
+    )
     return PreviewResponse(
-        preview_url=preview.preview_url,
+        # Deliberately NOT `preview.preview_url`, which is the stored
+        # `/preview/{project_id}/` form from before previews were access
+        # controlled. Returning that would hand out an unauthenticated URL.
+        preview_url=f"/preview/{token}/",
         built_at=preview.built_at,
         status=preview.status,
+        expires_at=datetime.fromtimestamp(expires_at, tz=timezone.utc),
     )
 
 

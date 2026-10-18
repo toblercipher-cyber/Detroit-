@@ -60,8 +60,14 @@ from backend.agents.reference_analyzer import ReferenceAnalyzerAgent
 from backend.agents.requirement_analyzer import RequirementAnalyzerAgent
 from backend.agents.visual_ux_critic import VisualUxCriticAgent
 from backend.api import preview as preview_routes
+from backend.api import github as github_routes
+from backend.api import agui as agui_routes
 from backend.api import projects as projects_routes
+from backend.auth import preview_token
 from backend.auth.jwt import SupabaseTokenVerifier
+from backend.services.external_actions import ExternalActionService
+from backend.services.agui_stream import broker as agui_broker
+from backend.services.github_gateway import GitHubGateway
 from backend.config.settings import ConfigurationError, Settings, get_settings
 from backend.context.builder import ContextBuilder
 from backend.db import engine as db_engine
@@ -283,7 +289,13 @@ def build_project_service(
     )
 
     return ProjectService(
-        repository=repository, workflow=workflow, settings=settings
+        repository=repository,
+        workflow=workflow,
+        settings=settings,
+        # The run publishes AG-UI events here; `backend/api/agui.py` subscribes.
+        # Injected rather than imported inside the service so the service keeps
+        # no global state and tests can run the graph unobserved.
+        event_sink=agui_broker.publish,
     )
 
 
@@ -377,6 +389,49 @@ def _build_verifier(settings: Settings) -> SupabaseTokenVerifier | None:
     return SupabaseTokenVerifier(settings)
 
 
+def _preview_secret(settings: Settings) -> str:
+    """The signing key for preview URLs, or a dev-only generated one.
+
+    REQUIRED IN MULTI-USER MODE, AND STARTUP FAILS WITHOUT IT
+        Preview URLs carry their own authority: a browser cannot send a bearer
+        token for an iframe, so the right to read a generated site travels in a
+        signed URL instead. If that signature can be forged, any visitor can
+        mint a URL for any project and read another user's output -- the exact
+        hole this whole change closes.
+
+        So when ``DATABASE_URL_APP`` is set, meaning real users with real
+        separation, an absent key is a refusal to start rather than a warning.
+        The alternative -- quietly inventing a key -- produces a system that
+        looks protected and is not, which ``docs/security.md`` 9 names as the
+        failure mode to avoid.
+
+    SINGLE-USER DEVELOPMENT GETS A PROCESS-LOCAL KEY
+        With no application database there is one user and nothing to isolate
+        them from, and demanding a secret before anyone can look at a preview
+        would be friction with no security benefit. A random key is generated
+        and the warning says what that costs: tokens stop verifying when the
+        process restarts, and separate workers would reject each other's.
+    """
+    configured = settings.preview_url_secret
+    if configured is not None and configured.get_secret_value().strip():
+        return configured.get_secret_value()
+
+    if settings.is_app_role_configured:
+        raise ConfigurationError(
+            "PREVIEW_URL_SECRET is not set but DATABASE_URL_APP is. Preview "
+            "URLs carry their own authorization, so an unset signing key means "
+            "anyone could mint a URL for any user's generated site. Set "
+            "PREVIEW_URL_SECRET to a long random value."
+        )
+
+    logger.warning(
+        "PREVIEW_URL_SECRET is not set: generating a process-local key. "
+        "Preview URLs will stop working after a restart, and this is only "
+        "acceptable for single-user development."
+    )
+    return preview_token.generate_dev_secret()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Validate configuration and prepare the runtime before serving traffic.
@@ -407,6 +462,40 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         checkpointer = await _open_checkpointer(stack, settings)
         repository = _open_repository(stack, settings)
         app.state.token_verifier = _build_verifier(settings)
+        app.state.preview_url_secret = _preview_secret(settings)
+
+        # --- GitHub integration (docs/mcp.md 2.1) ---
+        #
+        # Built unconditionally. An unconfigured gateway is a USABLE object
+        # that reports "not configured" when asked, which is what lets the UI
+        # show a truthful disconnected state. Building it only when a token
+        # exists would mean the status route 503s instead of answering, and a
+        # 503 reads as "broken" rather than "not set up".
+        app.state.github_gateway = GitHubGateway(
+            token=settings.github_token,
+            api_base_url=settings.github_api_base_url,
+            mcp_server_url=settings.mcp_github_server_url,
+        )
+
+        # The two-phase approval gate. `capability_check` is what decides
+        # whether an action is offered at all: with no GitHub route configured
+        # every action is 501 capability_unavailable, which is the correct
+        # answer rather than a button that fails later (docs/mcp.md 4).
+        github_ready = settings.is_github_configured
+        app.state.external_actions = ExternalActionService(
+            capability_check=(lambda action: github_ready)
+            if github_ready
+            else None
+        )
+        logger.info(
+            "github integration: %s (mcp server %s)",
+            "configured" if github_ready else "NOT configured",
+            "set" if settings.is_github_mcp_configured else "unset",
+        )
+        # The preview route builds `frame-ancestors` from the CORS allowlist,
+        # so it needs the settings this app was built with rather than a
+        # process-wide cached copy.
+        app.state.settings = settings
 
         # Routes resolve the service from application state, so composition
         # stays here rather than leaking into the route modules.
@@ -453,7 +542,9 @@ def create_app() -> FastAPI:
         CORSMiddleware,
         allow_origins=settings.allowed_origins,
         allow_credentials=False,
-        allow_methods=["GET", "POST", "DELETE"],
+        # PUT added for the GitHub repository selection, which is idempotent:
+        # setting the same repository twice is the same state, not two actions.
+        allow_methods=["GET", "POST", "PUT", "DELETE"],
         allow_headers=["Content-Type", "Authorization"],
     )
 
@@ -542,6 +633,12 @@ def create_app() -> FastAPI:
     # Static preview output. Deliberately outside /api/v1: it serves files a
     # model caused to exist, not typed JSON (docs/architecture.md 5.4).
     app.include_router(preview_routes.router)
+    # GitHub: status, repository selection, push and pull. Separate router so
+    # the whole external-write surface is readable in one file.
+    app.include_router(github_routes.router)
+    # AG-UI event stream. Attaches to a run already executing in a background
+    # task; it never starts one (backend/api/agui.py).
+    app.include_router(agui_routes.router)
 
     return app
 

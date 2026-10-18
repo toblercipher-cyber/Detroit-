@@ -52,6 +52,7 @@ _env = dotenv_values(".env")
 if not _env.get("DATABASE_URL_APP"):
     skip("DATABASE_URL_APP is not set; there is no owner-scoped store to test.")
 os.environ.setdefault("ANTHROPIC_API_KEY", "stub-key-for-tests")
+os.environ.setdefault("PREVIEW_URL_SECRET", "test-only-preview-signing-key")  # signs preview URLs; main.py refuses to start without one
 
 import psycopg  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -188,6 +188,62 @@ class RejectedOption(_Model):
     rejected_at: datetime = Field(default_factory=_utcnow)
 
 
+class ToolInvocation(_Model):
+    """One MCP tool the GitHub Operator proposes to call.
+
+    The model chooses a tool by NAME from the ones it was shown, and supplies
+    arguments. Neither is trusted: ``McpClient.call_tool`` re-checks that the
+    name was discovered, that the role may call its capability class, that an
+    approval exists, and that the arguments match the server's own schema
+    (``docs/mcp.md`` 4).
+    """
+
+    tool: str = Field(description="Must be one of the tools offered in context.")
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    reason: str = Field(default="", description="Why this tool, in one line.")
+
+
+class ExternalActionProposal(_Model):
+    """The GitHub Operator's output: what it would do, and why.
+
+    It PROPOSES; it does not perform. The approval gate sits between this and
+    any call, and ``docs/agents.md`` 4.12 is explicit that the operator
+    "produces a non-mutating plan for approval" before it "executes only the
+    approved plan".
+    """
+
+    summary: str = Field(description="What this would change, in user terms.")
+    invocations: list[ToolInvocation] = Field(default_factory=list)
+    # Set when the discovered tool set cannot do what was asked. Honest
+    # unavailability beats choosing a tool that merely sounds close
+    # (docs/mcp.md 4: do not substitute a different tool).
+    unsupported_reason: str | None = None
+
+
+class GitHubLink(_Model):
+    """The repository a project is connected to.
+
+    WHY THIS LIVES IN PROJECT STATE
+        It is a durable, user-made decision — exactly what ``CLAUDE.md`` 9 says
+        state is for — and it must survive a restart. It is also owner-scoped
+        for free: state is loaded through the owner-bound repository, so one
+        user cannot read or set another's repository selection.
+
+    NO CREDENTIAL IS STORED HERE, EVER. The token lives in server
+    configuration. This records only which repository was chosen, which is not
+    secret and is shown back to the user (``docs/security.md`` 2).
+    """
+
+    repository: str = Field(description="owner/name, validated before storage.")
+    default_branch: str = "main"
+    # The branch DETROIT pushes to. Separate from default_branch so a push
+    # never lands on main by accident.
+    branch: str = "detroit/generated"
+    selected_at: datetime = Field(default_factory=_utcnow)
+    last_pushed_at: datetime | None = None
+    last_commit_sha: str | None = None
+
+
 class McpActionRecord(_Model):
     """An external action that was actually performed, for audit."""
 
@@ -208,7 +264,22 @@ class BuildStatus(_Model):
 
 
 class PreviewStatus(_Model):
-    """Where the built preview is served from, and whether it is current."""
+    """Whether a build is available to preview, and whether it is current.
+
+    ``preview_url`` IS AN INTERNAL MARKER, NOT A USABLE ADDRESS
+        It holds the project-relative ``/preview/{project_id}/`` form, and
+        fetching that now returns 404: the static route takes a signed
+        five-minute capability token rather than a project id, because a
+        browser tab or an iframe cannot send an ``Authorization`` header
+        (``docs/security.md`` 9.1).
+
+        Its remaining job is to record that a successful build exists --
+        ``ProjectService.preview_available`` keys off it being non-null. The
+        address a client can actually fetch is minted per request by
+        ``GET /api/v1/projects/{id}/preview`` and is deliberately NOT stored,
+        because a five-minute credential has no business being persisted in
+        project state.
+    """
 
     preview_url: str | None = None
     built_at: datetime | None = None
@@ -602,6 +673,9 @@ class ProjectState(_Model):
     approved_decisions: list[ApprovedDecision] = Field(default_factory=list)
     rejected_options: list[RejectedOption] = Field(default_factory=list)
     mcp_action_history: list[McpActionRecord] = Field(default_factory=list)
+    # The connected repository, or None. Set by the GitHub routes; owner-scoped
+    # because state is only ever loaded through the owner-bound repository.
+    github: GitHubLink | None = None
     last_error: ErrorBody | None = None
 
     # --- Transient ---

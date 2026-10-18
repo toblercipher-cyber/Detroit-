@@ -1108,13 +1108,56 @@ def reference_gate_node(state: ProjectState, deps: WorkflowDependencies) -> dict
     )
 
 
+def halt_if_failed(state: ProjectState) -> str:
+    """Stop the run when the stage that just ran failed.
+
+    WHY THIS EXISTS
+        Every node already records a failure properly: ``_failure_update`` sets
+        ``run_status = FAILED`` and a safe ``last_error``. But the edges
+        between stages used to be UNCONDITIONAL, so a failed stage still
+        advanced into the next one — and into that stage's HITL gate.
+
+        The gate node interrupts before any router is consulted, so
+        ``route_after_gate``'s existing ``run_status is FAILED -> "stop"`` never
+        got the chance to fire. The observable result, verified against a real
+        run with an invalid provider key:
+
+            run_status : awaiting_hitl        (not failed)
+            summary    : "A plan is ready for review."
+            question   : None     options: []
+
+        The planner had never run. The user was asked to approve a plan that
+        did not exist, with nothing to approve it with, and the real cause --
+        an upstream model error already sitting in ``last_error`` -- was
+        invisible.
+
+        So the check has to happen on the EDGE, before the next node executes.
+        A failed run now ends, leaving ``run_status = FAILED`` and
+        ``last_error`` as the terminal state, which is what
+        ``docs/workflow.md`` 6 and CLAUDE.md 26 require.
+
+    WHY NOT INSIDE EACH NODE
+        Because a node that fails has already returned; something downstream of
+        it has to decide. Putting the decision on the edge keeps every node
+        ignorant of what follows it, and makes "a failure stops the run" one
+        fact in one place rather than eight.
+    """
+    return "stop" if state.run_status is RunStatus.FAILED else "continue"
+
+
 def route_after_preview(state: ProjectState) -> str:
     """First pass goes to Evaluation; a pass after a fix goes to Re-evaluation.
 
     The two run identical work (:func:`_evaluate`); only the recorded stage
     differs. Branching here rather than inside the node keeps "which pass is
     this" a property of the path taken, not of a flag the node has to interpret.
+
+    A failed Build or Preview stops here rather than being evaluated: there is
+    nothing rendered to review, and running the quality gate over a stage that
+    did not produce output would report a verdict about nothing.
     """
+    if state.run_status is RunStatus.FAILED:
+        return "stop"
     return "re_evaluate" if state.iteration_count > 0 else "evaluate"
 
 
@@ -1236,10 +1279,20 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_node(NODE_FINAL_GATE, _final_gate)
 
     graph.add_edge(START, NODE_REQUIREMENT_ANALYSIS)
-    graph.add_edge(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
-    graph.add_edge(NODE_PLANNING, NODE_PLAN_GATE)
-    graph.add_edge(NODE_DESIGN, NODE_DESIGN_GATE)
-    graph.add_edge(NODE_REFERENCE_ANALYSIS, NODE_REFERENCE_GATE)
+
+    # Every stage-to-stage edge is conditional on the stage having SUCCEEDED.
+    # These were unconditional, which let a failed stage advance into the next
+    # one and into its HITL gate -- the gate then interrupted and asked the
+    # user to approve output that was never produced. See `halt_if_failed`.
+    def _advance(source: str, target: str) -> None:
+        graph.add_conditional_edges(
+            source, halt_if_failed, {"continue": target, "stop": END}
+        )
+
+    _advance(NODE_REQUIREMENT_ANALYSIS, NODE_PLANNING)
+    _advance(NODE_PLANNING, NODE_PLAN_GATE)
+    _advance(NODE_DESIGN, NODE_DESIGN_GATE)
+    _advance(NODE_REFERENCE_ANALYSIS, NODE_REFERENCE_GATE)
 
     # Each gate: approval advances, a revision re-runs its own stage, a failure
     # stops. The router is shared; only the destinations differ.
@@ -1278,8 +1331,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     # Architecture, build and preview have no gates (docs/workflow.md 1), so they
     # run straight through. Preview terminates for now: `evaluation` is next and
     # is BLOCKED on Impeccable (CLAUDE.md 15), so the graph must not claim it.
-    graph.add_edge(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
-    graph.add_edge(NODE_BUILD, NODE_PREVIEW)
+    _advance(NODE_FRONTEND_ARCHITECTURE, NODE_BUILD)
+    _advance(NODE_BUILD, NODE_PREVIEW)
 
     # A fix changes src/, so the correction loop runs back through build and
     # preview: re-evaluating a stale dist/ would review the previous version
@@ -1288,7 +1341,11 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_conditional_edges(
         NODE_PREVIEW,
         route_after_preview,
-        {"evaluate": NODE_EVALUATION, "re_evaluate": NODE_RE_EVALUATION},
+        {
+            "evaluate": NODE_EVALUATION,
+            "re_evaluate": NODE_RE_EVALUATION,
+            "stop": END,
+        },
     )
 
     # Both passes share one verdict router; only the destinations are written
@@ -1308,8 +1365,8 @@ def build_workflow(deps: WorkflowDependencies, *, checkpointer: Any | None = Non
     graph.add_conditional_edges(NODE_EVALUATION, _verdict, verdict_targets)
     graph.add_conditional_edges(NODE_RE_EVALUATION, _verdict, verdict_targets)
 
-    graph.add_edge(NODE_TARGETED_FIX, NODE_BUILD)
-    graph.add_edge(NODE_FINAL_VALIDATION, NODE_FINAL_GATE)
+    _advance(NODE_TARGETED_FIX, NODE_BUILD)
+    _advance(NODE_FINAL_VALIDATION, NODE_FINAL_GATE)
 
     # Approval ends v1. `external_action` is next and is gated on MCP, which is
     # not built, so the graph does not claim it. A revision at the final gate

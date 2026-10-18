@@ -9,6 +9,7 @@ from pathlib import Path
 sys.path.insert(0, os.getcwd()); sys.dont_write_bytecode = True
 ok = lambda b: "PASS" if b else "**FAIL**"
 os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
+os.environ.setdefault("PREVIEW_URL_SECRET", "test-only-preview-signing-key")  # signs preview URLs; main.py refuses to start without one
 
 from langchain_core.messages import AIMessage
 from langchain_core.runnables import Runnable
@@ -233,7 +234,7 @@ print("   dist without index.html -> FAILED:",
       ok(pv3["run_status"] is RunStatus.FAILED))
 
 print()
-print("=== 10. The URL the node writes is the one that actually serves ===")
+print("=== 10. The build is servable, and only through a signed token ===")
 from fastapi.testclient import TestClient
 from backend.main import create_app
 from backend.services.projects import ProjectService
@@ -242,8 +243,22 @@ svc = ProjectService(repository=repo, workflow=object(), settings=get_settings()
 client = TestClient(create_app(), raise_server_exceptions=False)
 client.__enter__()
 client.app.state.project_service = svc
+
+# The URL the node stores is now an INTERNAL MARKER, not a fetchable address.
+# The static route takes a signed five-minute capability token instead of a
+# project id, because a browser tab or an iframe cannot send an Authorization
+# header (docs/security.md 9.1). So the stored form must NOT serve...
 r = client.get(ps.preview_url)
-print("   GET", ps.preview_url, "->", r.status_code, ok(r.status_code == 200))
+print("   stored URL is not directly fetchable:", r.status_code,
+      ok(r.status_code == 404))
+
+# ...and the token the API would issue for that project must.
+from backend.auth import preview_token as _pt
+from backend.tests.suites._auth_stub import TEST_USER_ID
+_tok, _ = _pt.issue(project_id=st.project_id, owner_id=str(TEST_USER_ID),
+                    secret=client.app.state.preview_url_secret)
+r = client.get("/preview/%s/" % _tok)
+print("   tokenised URL serves :", r.status_code, ok(r.status_code == 200))
 print("   serves the built page:", ok("<!doctype html" in r.text.lower()))
 print("   security headers present:",
       ok(r.headers.get("x-content-type-options") == "nosniff"))
@@ -258,7 +273,13 @@ print("   15 nodes      :", ok(len(nodes) == 15))
 print("   preview present:", ok(NODE_PREVIEW in nodes))
 edges = {(e.source, e.target) for e in g.get_graph().edges}
 print("   build -> preview:", ok((NODE_BUILD, NODE_PREVIEW) in edges))
-print("   build no longer -> END:", ok((NODE_BUILD, "__end__") not in edges))
+# `build -> END` used to be forbidden here, back when its presence meant the
+# graph stopped at Build because Preview was not implemented. It now exists
+# again with the OPPOSITE meaning: the failure halt, so a Build that failed
+# stops instead of being previewed and evaluated (failure_halt_check covers
+# the behaviour). What must still hold is that Build reaches Preview on the
+# success path, which the line above asserts.
+print("   build -> END is the failure halt:", ok((NODE_BUILD, "__end__") in edges))
 print("   preview -> evaluation:",
       ok((NODE_PREVIEW, "evaluation") in edges))
 print("   evaluation -> END :", ok(("evaluation", "__end__") in edges))

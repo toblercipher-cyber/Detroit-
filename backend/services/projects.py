@@ -38,12 +38,12 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from langgraph.types import Command
 
 from backend.config.settings import Settings
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from backend.memory.postgres import (
     OwnerScopedRepository,
@@ -66,6 +66,7 @@ from backend.schemas.state import (
     new_image_id,
     new_session_id,
 )
+from backend.services import agui_translator as agui
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +171,22 @@ def _sniff_image_type(content: bytes) -> str | None:
     return None
 
 
+def _safe_state(values: Any) -> ProjectState | None:
+    """Best-effort ProjectState from a mid-run values chunk, or None.
+
+    Used only to describe progress. A chunk that cannot be validated yields
+    None and the event is emitted without a snapshot — a malformed observation
+    must never interrupt the run it is observing.
+    """
+    if values is None:
+        return None
+    try:
+        state, _ = _state_from_result(values)
+        return state
+    except Exception:
+        return None
+
+
 def _state_from_result(result: Any) -> tuple[ProjectState, HitlCheckpoint | None]:
     """Split a graph result into project state and a pending gate, if any.
 
@@ -218,6 +235,7 @@ class ProjectService:
         repository: StateRepository,
         workflow: Any,
         settings: Settings,
+        event_sink: Callable[[str, Any], None] | None = None,
     ) -> None:
         """
         Args:
@@ -226,10 +244,86 @@ class ProjectService:
                 this class (docs/state.md 5.0).
             workflow: the compiled LangGraph workflow.
             settings: validated configuration; supplies the iteration limit.
+            event_sink: where AG-UI events go, as ``(project_id, event)``.
+                Injected rather than imported so this class keeps no global
+                state and a test can run the graph with no observer at all.
+                ``None`` means the run emits nothing, which is exactly what
+                every existing suite wants.
         """
         self._repository = repository
         self._workflow = workflow
         self._settings = settings
+        self._event_sink = event_sink
+
+    # --- AG-UI event emission --------------------------------------------
+
+    def _emit(self, project_id: str, event: Any) -> None:
+        """Publish one event, and never let the observer break the run.
+
+        A failing sink is a monitoring problem; a build that dies because a
+        browser disconnected is a product problem. The run always wins.
+        """
+        if self._event_sink is None:
+            return
+        try:
+            self._event_sink(project_id, event)
+        except Exception:  # pragma: no cover - defensive
+            logger.warning("agui event sink failed project_id=%s", project_id)
+
+    async def _run_graph(
+        self, project_id: str, payload: Any, config: dict[str, Any]
+    ) -> Any:
+        """Execute the graph, streaming AG-UI events, returning what ainvoke would.
+
+        WHY astream AND NOT ainvoke
+            ``ainvoke`` returns only the final mapping, so there is nothing to
+            report while a build runs. ``astream`` with BOTH modes gives the
+            per-node updates the timeline needs AND the full state values.
+
+        WHY THE RESULT IS STILL EXACTLY ainvoke's
+            Verified against the real graph rather than assumed: the last
+            ``values`` chunk already carries ``__interrupt__`` when a gate
+            fires, so it is the same mapping ``ainvoke`` returned and
+            ``_state_from_result`` parses it unchanged. Pause, resume and
+            failure handling are therefore untouched by this change.
+        """
+        run_id = uuid4().hex
+        last_values: Any = None
+        self._emit(project_id, agui.run_started(project_id, run_id))
+
+        async for mode, chunk in self._workflow.astream(
+            payload, config=config, stream_mode=["updates", "values"]
+        ):
+            if mode == "values":
+                last_values = chunk
+                continue
+            for node, _update in (chunk or {}).items():
+                if node == _INTERRUPT_KEY:
+                    continue
+                # The node has already finished by the time the update
+                # arrives; STEP_STARTED is emitted alongside so a client sees
+                # an opened and closed step rather than a bare close.
+                self._emit(project_id, agui.step_started(node))
+                self._emit(project_id, agui.activity(node))
+                state = _safe_state(last_values)
+                for event in agui.from_node_update(node, state):
+                    self._emit(project_id, event)
+
+        return last_values
+
+    def _emit_settled(self, project_id: str, state: ProjectState, run_id: str) -> None:
+        """Close out a run: the gate it is waiting at, or how it ended."""
+        self._emit(project_id, agui.state_snapshot(state))
+        if state.run_status is RunStatus.AWAITING_HITL:
+            self._emit(project_id, agui.hitl_waiting(state))
+        elif state.run_status is RunStatus.FAILED:
+            message = (
+                state.last_error.message
+                if state.last_error
+                else "The run failed."
+            )
+            self._emit(project_id, agui.run_error(message))
+        self._emit(project_id, agui.run_finished(project_id, run_id))
 
     # --- Caller scoping ---------------------------------------------------
 
@@ -314,6 +408,22 @@ class ProjectService:
     def get(self, project_id: str) -> ProjectState:
         """Load stored state, or raise :class:`ProjectNotFoundError`."""
         return self._repository.load(project_id)
+
+    def save(self, state: ProjectState) -> None:
+        """Persist a state this caller already loaded.
+
+        Owner-scoped like every other operation: on a bound service the
+        repository supplies the owner, and the UPDATE policy's WITH CHECK
+        refuses a row that is not the caller's. There is deliberately no
+        owner argument here — a caller that could name an owner could write
+        into another user's project (``docs/database.md`` 1.3.5).
+
+        Added for the GitHub routes, which mutate a project (the connected
+        repository, the sync timestamps, the action history) outside the
+        workflow. Those fields are user decisions and audit records, not graph
+        output, so they do not belong to a workflow node.
+        """
+        self._repository.save(state)
 
     def list_summaries(self) -> list[ProjectState]:
         """Stored projects, newest first.
@@ -451,8 +561,9 @@ class ProjectService:
         self._repository.save(state)
 
         config = {"configurable": {"thread_id": project_id}}
+        run_id = uuid4().hex
         try:
-            result = await self._workflow.ainvoke(state, config=config)
+            result = await self._run_graph(project_id, state, config)
         except Exception:
             # The graph records agent failures in state itself; reaching here means
             # the graph machinery failed, which is not something to route around.
@@ -460,6 +571,8 @@ class ProjectService:
             state.run_status = RunStatus.FAILED
             state.updated_at = _utcnow()
             self._repository.save(state)
+            self._emit(project_id, agui.run_error("The build could not be started."))
+            self._emit(project_id, agui.run_finished(project_id, run_id))
             raise
 
         updated, checkpoint = _state_from_result(result)
@@ -475,6 +588,7 @@ class ProjectService:
 
         updated.updated_at = _utcnow()
         self._repository.save(updated)
+        self._emit_settled(project_id, updated, run_id)
         logger.info(
             "workflow run settled project_id=%s stage=%s status=%s checkpoint=%s",
             project_id,
@@ -534,12 +648,14 @@ class ProjectService:
         stage = pending.stage
         config = {"configurable": {"thread_id": project_id}}
 
+        run_id = uuid4().hex
         try:
-            result = await self._workflow.ainvoke(
+            result = await self._run_graph(
+                project_id,
                 # mode="json" because the payload crosses the checkpointer, which
                 # serialises it; the gate re-validates it as a HitlDecisionRequest.
                 Command(resume=decision.model_dump(mode="json")),
-                config=config,
+                config,
             )
         except Exception as exc:
             # Nothing from LangGraph reaches the caller: the message could name
@@ -554,6 +670,8 @@ class ProjectService:
             state.run_status = RunStatus.FAILED
             state.updated_at = _utcnow()
             self._repository.save(state)
+            self._emit(project_id, agui.run_error("The review could not be resumed."))
+            self._emit(project_id, agui.run_finished(project_id, run_id))
             raise ProjectServiceError(
                 "The workflow could not be resumed from this review."
             ) from exc
@@ -572,6 +690,7 @@ class ProjectService:
 
         updated.updated_at = _utcnow()
         self._repository.save(updated)
+        self._emit_settled(project_id, updated, run_id)
 
         logger.info(
             "hitl decision applied project_id=%s stage=%s action=%s next_status=%s",

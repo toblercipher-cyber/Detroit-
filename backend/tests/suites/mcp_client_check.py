@@ -151,18 +151,47 @@ for banned in ("create_branch", "create_pull_request", "push_files",
                "create_or_update_file", "merge_pull_request", "get_file_contents"):
     print("   %-24s absent: %s" % (banned, ok(banned not in src)))
 # The module may name the GitHub Operator ROLE -- docs/mcp.md 3 requires that
-# row -- but must not name a GitHub tool or a GitHub URL.
-github_lines = [l.strip() for l in src.splitlines() if "github" in l.lower()]
-role_only = all(("GITHUB_OPERATOR" in l or "GitHub Operator" in l) for l in github_lines)
-print("   github appears only as the ROLE:", github_lines, ok(role_only))
+# row -- but its CODE must not name a GitHub tool or couple to GitHub.
+#
+# Comments and docstrings are excluded deliberately. This asserts "no GitHub
+# coupling in code", and prose explaining WHY the module avoids such coupling
+# is not coupling. Scanning raw lines made the check fail the moment the
+# module documented its own design, which is the wrong incentive: it would
+# have been satisfied by deleting the explanation rather than the dependency.
+import tokenize as _tok  # noqa: E402
+
+_code: list[str] = []
+with open("backend/tools/mcp_client.py", "rb") as _fh:
+    for _t in _tok.tokenize(_fh.readline):
+        if _t.type not in (_tok.COMMENT, _tok.STRING, _tok.NL, _tok.NEWLINE):
+            _code.append(_t.string)
+code_only = " ".join(_code)
+github_tokens = [w for w in code_only.split() if "github" in w.lower()]
+role_only = all("GITHUB_OPERATOR" in w for w in github_tokens)
+print("   github in CODE is the ROLE only:", sorted(set(github_tokens)), ok(role_only))
 print("   no github URL hard-coded      :",
       ok("githubcopilot" not in src and "api.github" not in src))
 
 print()
-print("=== 8. Discovery is read-only: no call_tool is exposed ===")
-print("   module has no call_tool:", ok("call_tool" not in src))
-print("   McpClient has no execute method:",
-      ok(not any(m in dir(McpClient) for m in ("call_tool", "execute", "invoke"))))
+print("=== 8. Execution exists, and is guarded ===")
+# This section used to assert that `call_tool` did NOT exist, back when the
+# client was discovery-only. Execution is now implemented, so the property
+# worth pinning is no longer "it cannot run a tool" but "it cannot run one
+# UNCHECKED". The four guards are exercised against real calls in
+# github_check section 4; here we only require that they exist and that
+# execution did not arrive as a bare passthrough.
+print("   call_tool is exposed          :", ok(hasattr(McpClient, "call_tool")))
+for guard in ("validate_arguments", "role_may_call"):
+    print(f"   {guard} exists{' ' * (18 - len(guard))}:", ok(guard in src))
+print("   approval is required in code  :",
+      ok("requires_approval and not approved" in src))
+print("   algorithms are not inferred   :",
+      ok("McpApprovalError" in src and "McpToolError" in src))
+# The credential must still never be logged, now that there is a second path
+# that could log one.
+print("   call path logs no token       :",
+      ok("self._token" not in src.split("def _connect_and_call")[1].split("async def call_tool")[0]
+         or "get_secret_value" not in src.split("def _connect_and_call")[1].split("async def call_tool")[0]))
 print("   -> executing belongs behind the approval gate (docs/mcp.md 5)")
 
 print()

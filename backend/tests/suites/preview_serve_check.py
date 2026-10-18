@@ -4,12 +4,13 @@ from pathlib import Path
 sys.path.insert(0, os.getcwd()); sys.dont_write_bytecode = True
 ok = lambda b: "PASS" if b else "**FAIL**"
 os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
+os.environ.setdefault("PREVIEW_URL_SECRET", "test-only-preview-signing-key")  # signs preview URLs; main.py refuses to start without one
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from backend.api import preview as preview_api
-from backend.api.preview import resolve_preview_file, _CONTENT_TYPES, _CSP
+from backend.api.preview import resolve_preview_file, _CONTENT_TYPES, _csp
 from backend.memory.artifacts import JsonArtifactRepository
 from backend.services.projects import ProjectService
 from backend.config.settings import get_settings
@@ -84,15 +85,23 @@ for rel in ["nope.js", "assets/nope.css", "deep/nope.html"]:
 
 print()
 print("=== 5. CSP is restrictive in the ways that matter ===")
+# frame-ancestors is now built from the CORS allowlist rather than being the
+# constant 'self', which named the BACKEND origin and so blocked the only
+# embed anyone wanted. The rest of the policy is unchanged.
+_CSP = _csp(["http://localhost:5173"])
 for directive, why in [("default-src 'none'", "deny by default"),
                        ("script-src 'self'", "no inline script"),
                        ("connect-src 'none'", "no exfiltration"),
                        ("form-action 'none'", "no posting out"),
                        ("base-uri 'none'", "no base hijack"),
-                       ("frame-ancestors 'self'", "embeddable by us only")]:
-    print("   %-26s %-24s %s" % (directive, why, ok(directive in _CSP)))
+                       ("frame-ancestors http://localhost:5173", "allowlisted embed")]:
+    print("   %-26s %-24s %s" % (directive[:26], why, ok(directive in _CSP)))
 print("   script 'unsafe-inline' NOT granted:",
       ok("script-src 'self'" in _CSP and "script-src 'self' 'unsafe-inline'" not in _CSP))
+print("   never a wildcard                 :",
+      ok("frame-ancestors *" not in _csp(["*", "http://localhost:5173"])))
+print("   empty allowlist denies framing   :",
+      ok("frame-ancestors 'none'" in _csp([])))
 
 print()
 print("=== 6. Over HTTP, with the real app's error envelope ===")
@@ -104,7 +113,25 @@ authenticate(client.app)
 client.__enter__()
 client.app.state.project_service = svc
 
-r = client.get("/preview/%s/" % PID)
+# The static route is no longer addressed by project id: it takes a signed,
+# five-minute capability token, because a browser loading a preview in a tab or
+# an iframe cannot send an Authorization header. Minted here with the app's own
+# key, exactly as GET /api/v1/projects/{id}/preview does it.
+from uuid import UUID as _UUID
+from backend.auth import preview_token as _pt
+from backend.tests.suites._auth_stub import TEST_USER_ID
+
+def token_for(project_id: str) -> str:
+    tok, _ = _pt.issue(project_id=project_id, owner_id=str(TEST_USER_ID),
+                       secret=client.app.state.preview_url_secret)
+    return tok
+
+TOKEN = token_for(PID)
+
+print("   OLD /preview/{id}/ shape is dead:",
+      ok(client.get("/preview/%s/index.html" % PID).status_code == 404))
+
+r = client.get("/preview/%s/" % TOKEN)
 print("   index 200      :", r.status_code, ok(r.status_code == 200))
 print("   body is ours   :", ok("Coffee" in r.text))
 print("   nosniff        :", r.headers.get("x-content-type-options"),
@@ -115,7 +142,7 @@ print("   referrer policy:", ok(r.headers.get("referrer-policy") == "no-referrer
 print("   content-type   :", r.headers.get("content-type"),
       ok("text/html" in r.headers.get("content-type", "")))
 
-r = client.get("/preview/%s/assets/app.js" % PID)
+r = client.get("/preview/%s/assets/app.js" % TOKEN)
 print("   js served      :", r.status_code, ok(r.status_code == 200))
 print("   js content-type:", r.headers.get("content-type"),
       ok("javascript" in r.headers.get("content-type", "")))
@@ -123,10 +150,10 @@ print("   headers on assets too:", ok(r.headers.get("x-content-type-options") ==
 
 print()
 print("=== 7. Over HTTP: traversal and unknown projects all 404 ===")
-for path in ["/preview/%s/../../SECRET.env" % PID,
-             "/preview/%s/..%%2f..%%2fSECRET.env" % PID,
-             "/preview/%s/danger.exe" % PID,
-             "/preview/proj_%s/index.html" % ("0" * 32),
+for path in ["/preview/%s/../../SECRET.env" % TOKEN,
+             "/preview/%s/..%%2f..%%2fSECRET.env" % TOKEN,
+             "/preview/%s/danger.exe" % TOKEN,
+             "/preview/%s/index.html" % token_for("proj_" + "0" * 32),
              "/preview/not-an-id/index.html"]:
     rr = client.get(path)
     body_leaks = "ANTHROPIC" in rr.text or "real-key" in rr.text
@@ -137,7 +164,7 @@ for path in ["/preview/%s/../../SECRET.env" % PID,
 print()
 print("=== 8. Unbuilt project serves nothing ===")
 st2 = svc.create(prompt="never built")
-r = client.get("/preview/%s/" % st2.project_id)
+r = client.get("/preview/%s/" % token_for(st2.project_id))
 print("   404 when no dist/:", r.status_code, ok(r.status_code == 404))
 
 print()
@@ -147,7 +174,7 @@ for rt in preview_api.router.routes:
     methods |= {m for m in getattr(rt, "methods", set()) if m != "HEAD"}
 print("   methods declared:", sorted(methods), ok(methods == {"GET"}))
 for verb in ("post", "put", "delete", "patch"):
-    rr = getattr(client, verb)("/preview/%s/index.html" % PID)
+    rr = getattr(client, verb)("/preview/%s/index.html" % TOKEN)
     print("   %-6s rejected: %s %s" % (verb.upper(), rr.status_code,
                                        ok(rr.status_code in (404, 405))))
 
@@ -175,11 +202,16 @@ svc._repository.save(s)
 r = client.get("%s/%s/preview" % (P, PID))
 print("   200 once built   :", r.status_code, ok(r.status_code == 200))
 body = r.json()
-print("   preview_url      :", body["preview_url"],
-      ok(body["preview_url"] == "/preview/%s/" % PID))
+# The URL is now a capability, so it must NOT be the stored /preview/{id}/
+# form -- returning that would hand out an unauthenticated URL.
+print("   preview_url is tokenised:",
+      ok(body["preview_url"].startswith("/preview/")
+         and PID not in body["preview_url"]))
 print("   status fresh     :", body["status"], ok(body["status"] == "fresh"))
 print("   built_at returned:", ok(body.get("built_at") is not None))
-print("   no extra fields  :", ok(set(body) == {"preview_url", "built_at", "status"}))
+print("   expires_at returned:", ok(body.get("expires_at") is not None))
+print("   no extra fields  :",
+      ok(set(body) == {"preview_url", "built_at", "status", "expires_at"}))
 
 # (c) The URL it reports actually serves.
 r2 = client.get(body["preview_url"])

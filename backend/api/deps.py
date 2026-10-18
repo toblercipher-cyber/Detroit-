@@ -119,6 +119,27 @@ def get_caller(
         raise _unauthenticated(str(exc)) from None
 
 
+def get_preview_secret(request: Request) -> str:
+    """The HS256 key that signs preview URLs, from application state.
+
+    Resolved once at startup like the token verifier, for the same reason: it
+    is process-wide configuration, not something to re-read per request.
+
+    503 rather than 401 when it is absent. A missing signing key is a
+    deployment fault — the caller did nothing wrong and has no way to fix it,
+    so telling them "unauthenticated" would be misleading. ``main.py`` refuses
+    to start in multi-user mode without one, so reaching this in that mode
+    means the wiring is broken rather than the configuration.
+    """
+    secret: str | None = getattr(request.app.state, "preview_url_secret", None)
+    if not secret:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Preview URLs are not configured on this server.",
+        )
+    return secret
+
+
 def get_project_service(request: Request) -> ProjectService:
     """The unbound service. For routes that touch no project data."""
     service: ProjectService | None = getattr(

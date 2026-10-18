@@ -88,6 +88,14 @@ def test_suite(suite: Path) -> None:
         "ANTHROPIC_API_KEY": os.environ.get(
             "ANTHROPIC_API_KEY", "test-only-not-a-real-key"
         ),
+        # Signs preview URLs. The backend REFUSES TO START without it whenever
+        # DATABASE_URL_APP is set (backend/main.py `_preview_secret`), so any
+        # suite that builds the real app needs one. Supplied here so that is
+        # true for every suite at once rather than remembered per file; suites
+        # also setdefault their own, for when they are run directly.
+        "PREVIEW_URL_SECRET": os.environ.get(
+            "PREVIEW_URL_SECRET", "test-only-preview-signing-key"
+        ),
     }
 
     try:

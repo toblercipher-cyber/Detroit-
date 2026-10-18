@@ -54,7 +54,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from typing import Annotated
+
 from pydantic import Field, SecretStr, ValidationError, field_validator
+from pydantic_settings import NoDecode
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # The literal placeholder shipped in .env.example. Rejected explicitly so that
@@ -164,7 +167,14 @@ class Settings(BaseSettings):
         description="Must stay loopback while there is no authentication.",
     )
     api_port: int = Field(default=8000, ge=1, le=65535)
-    allowed_origins: list[str] = Field(
+    # NoDecode is load-bearing, not decoration. pydantic-settings treats a
+    # list field as "complex" and JSON-decodes it AT THE SOURCE, before any
+    # validator runs — so `ALLOWED_ORIGINS=http://localhost:5173` in .env died
+    # with "Expecting value: line 1 column 1" and took the whole backend down
+    # with it. NoDecode hands the raw string to `_split_csv` below, which is
+    # what was always meant to parse it. .env.example documents exactly that
+    # form, so without this the documented configuration cannot start.
+    allowed_origins: Annotated[list[str], NoDecode] = Field(
         default=["http://localhost:5173"],
         min_length=1,
         description="Explicit CORS allowlist. Comma-separated in the environment.",
@@ -237,10 +247,77 @@ class Settings(BaseSettings):
         description="SECRET: already embedded in DATABASE_URL. Unused separately.",
     )
 
+    # --- GitHub integration (docs/mcp.md 2.1, docs/security.md 2) ---
+    #
+    # Two independent routes to GitHub, and the gateway picks between them by
+    # DISCOVERED capability rather than by preference:
+    #
+    #   MCP_GITHUB_SERVER_URL -> an MCP server that advertises repository tools
+    #   GITHUB_TOKEN          -> the REST adapter, used directly
+    #
+    # Either alone is enough to be "configured". Neither present means the
+    # integration reports unavailable -- it never pretends to be connected
+    # (docs/mcp.md 1).
+
+    mcp_github_server_url: str | None = Field(
+        default=None,
+        description=(
+            "Endpoint of an MCP server exposing GitHub tools. Not a secret: it "
+            "is a location. Its credential travels in GITHUB_TOKEN."
+        ),
+    )
+
+    github_token: SecretStr | None = Field(
+        default=None,
+        description=(
+            "SECRET: GitHub credential (PAT or installation token). Used as the "
+            "bearer for the MCP server AND by the REST adapter. Never logged, "
+            "never returned by an API route, never placed in agent context "
+            "(docs/security.md 2, docs/mcp.md 6)."
+        ),
+    )
+
+    github_api_base_url: str = Field(
+        default="https://api.github.com",
+        description=(
+            "Overridable for GitHub Enterprise. Not a secret. Validated as "
+            "https-only below, because a plaintext base URL would put the "
+            "token on the wire in clear."
+        ),
+    )
+
+    # Test-only knobs for backend/tests/suites/github_live_check.py. Declared
+    # here ONLY because `extra="forbid"` above makes any undeclared key in
+    # .env a hard startup failure — and .env.example documents these, so a
+    # developer who copies it would otherwise get a backend that refuses to
+    # boot with a confusing error. Nothing in the application reads them.
+    github_live_tests: str | None = Field(
+        default=None, description="Test-only. Set to 1 to enable live GitHub tests."
+    )
+    github_test_repo: str | None = Field(
+        default=None, description="Test-only. owner/name used by the live suite."
+    )
+
+    # --- Preview capability tokens (docs/api.md 2.5, docs/security.md 9) ---
+
+    preview_url_secret: SecretStr | None = Field(
+        default=None,
+        description=(
+            "SECRET: HS256 signing key for short-lived preview URLs. A browser "
+            "loading a preview in a tab or an iframe cannot send an "
+            "Authorization header, so the capability travels in the URL and "
+            "must be unforgeable. REQUIRED whenever DATABASE_URL_APP is set: "
+            "in multi-user mode a guessable or absent key means cross-user "
+            "reads of generated sites. In single-user development main.py "
+            "generates a process-local key instead and warns."
+        ),
+    )
+
     # --- Reference image uploads (docs/api.md 2.4, docs/security.md 4) ---
 
     max_upload_bytes: int = Field(default=10_485_760, gt=0)
-    allowed_upload_types: list[str] = Field(
+    # Same source-level decode problem as allowed_origins above.
+    allowed_upload_types: Annotated[list[str], NoDecode] = Field(
         default=["image/png", "image/jpeg", "image/webp"],
         min_length=1,
         description="Declared type must also match magic bytes at upload time.",
@@ -270,6 +347,31 @@ class Settings(BaseSettings):
     _split_upload_types = field_validator("allowed_upload_types", mode="before")(
         _split_csv
     )
+
+    @field_validator("github_api_base_url", "mcp_github_server_url")
+    @classmethod
+    def _require_https(cls, value: str | None) -> str | None:
+        """Refuse a plaintext endpoint for anything the token is sent to.
+
+        The GitHub credential travels as a bearer header to both of these. Over
+        http it would cross the network in clear, so a misconfiguration here is
+        credential disclosure, not a connectivity problem. localhost is allowed
+        because a developer MCP server commonly runs there and never leaves the
+        machine.
+        """
+        if value is None or not value.strip():
+            return value
+        url = value.strip().rstrip("/")
+        if url.startswith("https://"):
+            return url
+        if url.startswith("http://") and (
+            "//localhost" in url or "//127.0.0.1" in url or "//[::1]" in url
+        ):
+            return url
+        raise ValueError(
+            "must use https (http is allowed only for localhost): the GitHub "
+            "token is sent to this URL as a bearer credential"
+        )
 
     @field_validator("anthropic_api_key")
     @classmethod
@@ -351,6 +453,26 @@ class Settings(BaseSettings):
         storage is not yet wired, which is exactly the state during migration.
         """
         return self.database_url_app is not None
+
+    @property
+    def is_github_configured(self) -> bool:
+        """True when SOME route to GitHub exists.
+
+        Either an MCP server or a direct token is enough. False means the
+        integration reports unavailable rather than offering buttons that
+        cannot work (docs/mcp.md 1).
+        """
+        return bool(self.mcp_github_server_url) or self.github_token is not None
+
+    @property
+    def is_github_mcp_configured(self) -> bool:
+        """True when an MCP server URL is set. Discovery decides the rest."""
+        return bool(self.mcp_github_server_url)
+
+    @property
+    def is_github_rest_configured(self) -> bool:
+        """True when a token is present for the direct REST adapter."""
+        return self.github_token is not None
 
     @property
     def is_database_configured(self) -> bool:

@@ -8,6 +8,7 @@ from pathlib import Path
 sys.path.insert(0, os.getcwd()); sys.dont_write_bytecode = True
 ok = lambda b: "PASS" if b else "**FAIL**"
 os.environ["ANTHROPIC_API_KEY"] = "test-only-not-a-real-key"
+os.environ.setdefault("PREVIEW_URL_SECRET", "test-only-preview-signing-key")  # signs preview URLs; main.py refuses to start without one
 
 from fastapi.testclient import TestClient
 from langchain_core.runnables import Runnable

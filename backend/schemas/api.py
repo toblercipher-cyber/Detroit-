@@ -159,11 +159,20 @@ class ProjectCreatedResponse(_Model):
 
 
 class ProjectSummary(_Model):
+    """One project in a listing.
+
+    Carries what a dashboard needs so it does not have to fetch every project
+    individually: `list_summaries` already loads the full state, so these cost
+    nothing extra here and save N requests there.
+    """
+
     project_id: str
     title: str
     stage: WorkflowStage
     status: RunStatus
     updated_at: datetime
+    created_at: datetime
+    iteration_count: int = Field(default=0, ge=0)
 
 
 class ProjectSummaryList(_Model):
@@ -339,11 +348,24 @@ class PreviewResponse(_Model):
     Stricter than the stored ``PreviewStatus``: this is returned only once a
     successful build exists, so the URL and timestamp are required. Without one the
     API returns 409 ``preview_not_available`` instead (docs/api.md 2.5).
+
+    ``preview_url`` CARRIES A CAPABILITY AND IS SHORT-LIVED
+        It is ``/preview/{token}/`` -- a signed token, not a project id. The
+        static route sends no ``Authorization`` header because a browser tab or
+        an iframe cannot, so the right to read this project's built output
+        travels in the URL instead (``backend/auth/preview_token.py``).
+
+        Two consequences for anyone consuming this model. The URL expires, at
+        ``expires_at``, and a client that wants to keep showing a preview
+        re-requests this endpoint rather than caching the string. And the URL
+        is a credential: it should not be logged, pasted into an issue, or
+        handed to anyone who is not entitled to the project.
     """
 
     preview_url: str
     built_at: datetime
     status: PreviewFreshness
+    expires_at: datetime
 
 
 class GeneratedFileManifest(_Model):
@@ -414,6 +436,109 @@ class ExternalActionResult(_Model):
     status: Literal["succeeded", "failed"]
     detail: str
     performed_at: datetime
+
+
+# ---------------------------------------------------------------------------
+# GitHub integration (docs/mcp.md 2.1)
+# ---------------------------------------------------------------------------
+
+
+class GitHubStatusResponse(_Model):
+    """Whether GitHub is usable from this server.
+
+    CONTAINS NO CREDENTIAL, and nothing derived from one — not a prefix, not a
+    length, not a masked form. ``configured`` is the answer to "can this work",
+    which is all a browser needs (``docs/security.md`` 2).
+
+    ``configured`` is verified by a real call, not by the presence of an
+    environment variable: a revoked or wrong-scoped token is "set" and still
+    cannot work, and reporting that as connected is the false claim this
+    integration must not make.
+    """
+
+    configured: bool
+    mode: Literal["rest", "mcp", "none"]
+    reason: str = ""
+    mcp_server_configured: bool = False
+    mcp_tools_discovered: int | None = None
+    account: str | None = None
+
+
+class RepositorySummary(_Model):
+    full_name: str
+    default_branch: str
+    private: bool
+    can_push: bool
+    html_url: str
+
+
+class RepositoryList(_Model):
+    repositories: list[RepositorySummary] = Field(default_factory=list)
+
+
+class GitHubLinkResponse(_Model):
+    """The repository this project is connected to, or nothing."""
+
+    connected: bool
+    repository: str | None = None
+    default_branch: str | None = None
+    branch: str | None = None
+    last_pushed_at: datetime | None = None
+    last_commit_sha: str | None = None
+
+
+class SelectRepositoryRequest(_Model):
+    repository: str = Field(min_length=3, description="owner/name")
+    branch: str | None = Field(
+        default=None, description="Branch DETROIT pushes to. Defaults to detroit/generated."
+    )
+
+
+class SyncChange(_Model):
+    """One file's fate in a sync preview."""
+
+    path: str
+    # Push emits exactly these. "unchanged" and "conflict" belonged to the
+    # removed pull path.
+    kind: Literal["add", "update", "skip"]
+    reason: str = ""
+    size_bytes: int = 0
+
+
+class SyncPlanResponse(_Model):
+    """What a push or pull WOULD do, plus the approval needed to do it.
+
+    Producing this mutates nothing. The token is single-use and short-lived,
+    and execution without it is refused — the same two-phase gate every
+    external write uses (``docs/mcp.md`` 5).
+    """
+
+    direction: Literal["push"]
+    repository: str
+    branch: str
+    base_branch: str
+    added: int
+    updated: int
+    skipped: int
+    changes: list[SyncChange] = Field(default_factory=list)
+    plan_id: str
+    approval_token: str
+    expires_at: datetime
+
+
+class ExecuteSyncRequest(_Model):
+    plan_id: str
+    approval_token: str
+    commit_message: str | None = None
+
+
+class SyncResultResponse(_Model):
+    direction: Literal["push"]
+    repository: str
+    branch: str
+    files_written: int
+    commit_sha: str | None = None
+    detail: str = ""
 
 
 class ExternalActionHistory(_Model):
