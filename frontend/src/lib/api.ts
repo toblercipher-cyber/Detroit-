@@ -89,15 +89,38 @@
 /**
  * Where the builder backend listens.
  *
- * Default matches the backend's own defaults: `API_HOST=127.0.0.1`,
- * `API_PORT=8000` (`docs/runtime.md` §3.2). Override with `VITE_API_BASE_URL`
- * in a frontend `.env` — which must hold a URL and nothing else. No secret is
- * ever read here; the provider key lives server-side only.
+ * Two different answers, because the two situations are genuinely different.
+ *
+ * DEV (`vite dev`): an absolute `http://127.0.0.1:8000`, matching the
+ * backend's own defaults `API_HOST=127.0.0.1` / `API_PORT=8000`
+ * (`docs/runtime.md` §3.2). The dev server is a separate origin on :5173 and
+ * there is no Vite proxy, so a relative path would hit Vite and 404.
+ *
+ * BUILT (`vite build`): the empty string, meaning same-origin. This is the
+ * right default for the target deployment — a rewrite in front of the SPA
+ * that forwards `/api/(.*)` and `/preview/(.*)` to the backend, which makes
+ * every URL this module builds correct as a relative path. It replaces a
+ * default that baked `http://127.0.0.1:8000` into the production bundle and
+ * so pointed every visitor's browser at their own machine.
+ *
+ * TODAY THAT REWRITE DOES NOT EXIST. `vercel.json` deploys the frontend
+ * alone: the backend needs headless Chromium, an npm toolchain, the
+ * Impeccable CLI and a persistent `BUILDER_DATA_DIR`, none of which a
+ * serverless Python function has. Until it is hosted somewhere, a deployed
+ * build MUST be given `VITE_API_BASE_URL` pointing at it, or nothing here
+ * reaches a backend at all.
+ *
+ * `VITE_API_BASE_URL` overrides both defaults. It must hold a URL and
+ * nothing else. No secret is ever read here; the provider key lives
+ * server-side only.
  */
 import { getAccessToken } from "@/lib/auth";
 
+/* `??` not `||`: an explicit empty VITE_API_BASE_URL means "same origin" and
+   must not fall through to the dev default. */
 export const API_BASE_URL: string = (
-  import.meta.env.VITE_API_BASE_URL ?? "http://127.0.0.1:8000"
+  import.meta.env.VITE_API_BASE_URL ??
+  (import.meta.env.DEV ? "http://127.0.0.1:8000" : "")
 )
   .toString()
   .replace(/\/+$/, "");
