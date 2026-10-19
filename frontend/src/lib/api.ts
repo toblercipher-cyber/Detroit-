@@ -574,7 +574,34 @@ export const CLIENT_ERROR_CODES = {
   NETWORK_UNREACHABLE: "client_network_unreachable",
   /** A response arrived but was not the JSON this contract specifies. */
   MALFORMED_RESPONSE: "client_malformed_response",
+  /** The SPA's own HTML came back, so no backend is deployed behind it. */
+  BACKEND_UNAVAILABLE: "client_backend_unavailable",
 } as const;
+
+/**
+ * Shown when a deployment has no backend behind it.
+ *
+ * Deliberately says what is and is not true: the interface works, nothing is
+ * generated. It must never imply a run happened.
+ */
+const BACKEND_UNAVAILABLE_MESSAGE =
+  "Demo mode — no backend is connected to this deployment, so this action " +
+  "cannot run. You can explore the interface, but nothing is generated.";
+
+/**
+ * True when a response is the SPA shell rather than an API reply.
+ *
+ * A static host serving this app needs a catch-all rewrite to `index.html`,
+ * which answers every unmatched path with `200 text/html`. A request to
+ * `/api/v1/...` with no backend behind it therefore comes back as the page
+ * itself. Parsing that as JSON fails, and reporting it as a malformed
+ * response blamed the backend for bad JSON when there was no backend at all.
+ */
+function isSpaShell(response: Response): boolean {
+  return (response.headers.get("content-type") ?? "")
+    .toLowerCase()
+    .includes("text/html");
+}
 
 /**
  * A failed API call, carrying the backend's own code and message.
@@ -661,6 +688,15 @@ async function toApiError(response: Response): Promise<ApiError> {
     });
   }
 
+  if (isSpaShell(response)) {
+    return new ApiError({
+      code: CLIENT_ERROR_CODES.BACKEND_UNAVAILABLE,
+      message: BACKEND_UNAVAILABLE_MESSAGE,
+      status: response.status,
+      clientSide: true,
+    });
+  }
+
   return new ApiError({
     code: CLIENT_ERROR_CODES.MALFORMED_RESPONSE,
     message: `The backend returned ${response.status} without the expected error envelope.`,
@@ -728,9 +764,17 @@ async function request<T>(path: string, options: RequestOptions = {}): Promise<T
   try {
     return (await response.json()) as T;
   } catch {
+    /* The common case on a frontend-only deployment: a 200 that is the SPA
+       shell, not JSON. Naming it as such beats accusing a backend that is
+       not there. */
+    const shell = isSpaShell(response);
     throw new ApiError({
-      code: CLIENT_ERROR_CODES.MALFORMED_RESPONSE,
-      message: "The backend returned a response that was not valid JSON.",
+      code: shell
+        ? CLIENT_ERROR_CODES.BACKEND_UNAVAILABLE
+        : CLIENT_ERROR_CODES.MALFORMED_RESPONSE,
+      message: shell
+        ? BACKEND_UNAVAILABLE_MESSAGE
+        : "The backend returned a response that was not valid JSON.",
       status: response.status,
       clientSide: true,
     });
